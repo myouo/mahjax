@@ -1,8 +1,9 @@
 """Phase 0-A: Offline Oracle-Supervised Belief Model (`B_fast`) + Post-Training Temperature Scaling.
 
+Supports automatic multi-GPU Data-Parallel training (`jax.pmap` + `lax.pmean` across all
+`jax.local_device_count()` GPUs, e.g., Kaggle T4x2) with zero config changes!
 Trains the 36x Equivariant `BeliefNet` with strictly UNWEIGHTED standard BCE + prior log-odds
 bias init (`-4.184`) and 20% unbiased opponent utility dropout (`W_PHOENIX_7D, is_known=0`).
-After training, calibrates `T_cal` via post-hoc temperature scaling on a validation pass.
 """
 
 from __future__ import annotations
@@ -20,6 +21,8 @@ from mahjong_rl.algo.sovereign_v6 import (
     compute_binary_roc_auc,
     fit_belief_temperature,
     make_weight_decay_mask,
+    replicate_for_pmap,
+    shard_for_pmap,
 )
 from mahjong_rl.algo.utility import build_opponent_utility_features, rotate_utility_matrix_ego
 from mahjong_rl.config import BeliefConfig
@@ -46,10 +49,27 @@ def _init_belief_params(model: BeliefNet, rng: jax.Array) -> Any:
 
 
 def _extract_w_opp_5d(w_table_abs, cp, rng_key, dropout_prob: float) -> jnp.ndarray:
-    w_ego_4x4 = jax.vmap(rotate_utility_matrix_ego)(w_table_abs, cp)  # (B, 4, 4)
-    w_opp = w_ego_4x4[:, 1:, :]                                       # (B, 3, 4)
+    w_ego_4x4 = jax.vmap(rotate_utility_matrix_ego)(w_table_abs, cp)
+    w_opp = w_ego_4x4[:, 1:, :]
     is_known = jnp.ones((w_opp.shape[0], 3), dtype=jnp.float32)
     return build_opponent_utility_features(w_opp, is_known, rng_key=rng_key, dropout_prob=dropout_prob)
+
+
+def _replicate(tree: Any, n_devices: int) -> Any:
+    return replicate_for_pmap(tree, n_devices)
+
+
+def _unreplicate(tree: Any) -> Any:
+    return jax.tree_util.tree_map(lambda x: x[0], tree)
+
+
+def _shard_batch(batch_np: Dict[str, np.ndarray], keys: Sequence[str], n_devices: int) -> Dict[str, Any]:
+    out = {}
+    for k in keys:
+        a = batch_np[k]
+        per_dev = a.shape[0] // n_devices
+        out[k] = a[: per_dev * n_devices].reshape((n_devices, per_dev) + a.shape[1:])
+    return shard_for_pmap(out, n_devices)
 
 
 def train_belief(
@@ -57,8 +77,9 @@ def train_belief(
     cfg: BeliefConfig = BeliefConfig(),
     val_shard_paths: Sequence[Path | str] | None = None,
     suit_augment: bool = True,
+    multi_gpu: bool = True,
 ) -> Tuple[BeliefNet, Any, float, List[Dict[str, float]]]:
-    """Train Phase 0-A `BeliefNet` and return `(model, params, T_cal, history)`."""
+    """Train Phase 0-A `BeliefNet` (auto multi-GPU `pmap` if >1 GPU) and return `(model, params, T_cal, history)`."""
     model = BeliefNet(config=cfg)
     rng = jax.random.PRNGKey(cfg.seed)
     rng, k_init = jax.random.split(rng)
@@ -70,13 +91,15 @@ def train_belief(
     )
     opt_state = optimizer.init(params)
 
-    @jax.jit
-    def train_step(params, opt_state, batch, step_key):
+    n_devices = jax.local_device_count() if multi_gpu else 1
+    use_pmap = n_devices > 1 and (cfg.batch_size % n_devices == 0)
+
+    def _loss_and_grads(p, batch, step_key):
         w_opp_5d = _extract_w_opp_5d(batch["w_table_abs"], batch["current_player"], step_key, cfg.utility_dropout)
 
-        def loss_fn(p):
+        def loss_fn(p_in):
             out = model.apply(
-                p,
+                p_in,
                 planes=batch["planes"],
                 scalars=batch["scalars"],
                 river_tokens=batch["river_tokens"],
@@ -93,16 +116,34 @@ def train_belief(
                 cfg=cfg,
             )
 
-        (loss, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, metrics
+        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
+        return grads, metrics
+
+    if use_pmap:
+        def _pmap_step(p, o, batch, step_key):
+            grads, metrics = _loss_and_grads(p, batch, step_key)
+            grads = jax.lax.pmean(grads, axis_name="devices")
+            metrics = jax.lax.pmean(metrics, axis_name="devices")
+            updates, o = optimizer.update(grads, o, p)
+            p = optax.apply_updates(p, updates)
+            return p, o, metrics
+
+        train_step_pmap = jax.pmap(_pmap_step, axis_name="devices")
+        params_rep = _replicate(params, n_devices)
+        opt_rep = _replicate(opt_state, n_devices)
+    else:
+        @jax.jit
+        def train_step_jit(p, o, batch, step_key):
+            grads, metrics = _loss_and_grads(p, batch, step_key)
+            updates, o = optimizer.update(grads, o, p)
+            p = optax.apply_updates(p, updates)
+            return p, o, metrics
 
     @jax.jit
-    def eval_logits_step(params, batch):
+    def eval_logits_step(p, batch):
         w_opp_5d = _extract_w_opp_5d(batch["w_table_abs"], batch["current_player"], None, 0.0)
         out = model.apply(
-            params,
+            p,
             planes=batch["planes"],
             scalars=batch["scalars"],
             river_tokens=batch["river_tokens"],
@@ -136,19 +177,37 @@ def train_belief(
             keys=bel_keys,
             seed=cfg.seed + epoch,
         )
-        ep_metrics: Dict[str, List[float]] = {}
+        ep_acc: Dict[str, jnp.ndarray] | None = None
+        n_steps = 0
         for batch_np in loader:
             rng, k_step = jax.random.split(rng)
-            batch = {k: jnp.asarray(batch_np[k]) for k in bel_keys}
-            params, opt_state, metrics = train_step(params, opt_state, batch, k_step)
-            for mk, mv in metrics.items():
-                ep_metrics.setdefault(mk, []).append(float(mv))
+            if use_pmap:
+                b_sharded = _shard_batch(batch_np, bel_keys, n_devices)
+                dev_keys = shard_for_pmap(jax.random.split(k_step, n_devices), n_devices)
+                params_rep, opt_rep, metrics = train_step_pmap(params_rep, opt_rep, b_sharded, dev_keys)
+                m_single = jax.tree_util.tree_map(lambda x: x[0], metrics)
+            else:
+                batch = {k: jnp.asarray(batch_np[k]) for k in bel_keys}
+                params, opt_state, m_single = train_step_jit(params, opt_state, batch, k_step)
+
+            if ep_acc is None:
+                ep_acc = m_single
+            else:
+                ep_acc = jax.tree_util.tree_map(lambda a, b: a + b, ep_acc, m_single)
+            n_steps += 1
+
         summary = {"epoch": float(epoch)}
-        for mk, vals in ep_metrics.items():
-            summary[mk] = float(np.mean(vals)) if vals else 0.0
+        if ep_acc is not None and n_steps > 0:
+            ep_host = jax.device_get(ep_acc)
+            for mk, mv in ep_host.items():
+                summary[mk] = float(mv) / n_steps
         history.append(summary)
 
-    # Post-training Temperature Scaling calibration on validation shards (or last pass)
+    if use_pmap:
+        params = jax.device_get(_unreplicate(params_rep))
+        params = jax.device_put(params, jax.local_devices()[0])
+
+    # Post-training Temperature Scaling calibration on held-out validation shards
     cal_shards = val_shard_paths if val_shard_paths else shard_paths
     cal_keys = (
         "planes",
@@ -161,22 +220,16 @@ def train_belief(
         "y_ron",
     )
     cal_loader = ShardBatchLoader(
-        cal_shards, batch_size=cfg.batch_size, shuffle=False, suit_augment=False, drop_last=True, keys=cal_keys
+        cal_shards,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        suit_augment=False,
+        drop_last=True,
+        keys=cal_keys,
     )
     all_logits, all_labels = [], []
     for batch_np in cal_loader:
-        batch = {
-            k: jnp.asarray(batch_np[k])
-            for k in (
-                "planes",
-                "scalars",
-                "river_tokens",
-                "river_tile_ids",
-                "river_valid_mask",
-                "w_table_abs",
-                "current_player",
-            )
-        }
+        batch = {k: jnp.asarray(batch_np[k]) for k in cal_keys if k != "y_ron"}
         d_logits, _ = eval_logits_step(params, batch)
         all_logits.append(np.asarray(jax.device_get(d_logits), dtype=np.float32))
         all_labels.append(np.asarray(batch_np["y_ron"], dtype=np.float32))

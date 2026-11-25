@@ -74,7 +74,7 @@ RULE_CORRIDOR_BANK = jnp.stack(
 def rotate_utility_matrix_ego(w_table_abs: jnp.ndarray, current_player: jnp.ndarray) -> jnp.ndarray:
     """Rotate absolute-seat utility matrix `(4, 4)` into ego-centric frame `[me, right, across, left]`."""
     order = (jnp.arange(4, dtype=jnp.int32) + current_player.astype(jnp.int32)) % 4
-    return w_table_abs[order]  # (4, 4)
+    return jnp.asarray(w_table_abs, dtype=jnp.float32)[order]  # (4, 4)
 
 
 def build_opponent_utility_features(

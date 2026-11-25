@@ -17,6 +17,7 @@ from jax import lax
 
 import mahjax
 from mahjax.common.action import Action
+from mahjong_rl.algo.sovereign_v6 import shard_for_pmap
 from mahjong_rl.config import EvalConfig
 
 
@@ -45,7 +46,8 @@ def evaluate_duplicate_1v3(
         round_end="confirm",
     )
     num_players = env.num_players
-    rank_pts_arr = jnp.asarray(cfg.rank_points, dtype=jnp.float32)
+    # Use host NumPy constant so `jax.pmap` can replicate cleanly across all GPUs!
+    rank_pts_arr = np.asarray(cfg.rank_points, dtype=np.float32)
 
     def play_single_seat(init_state, agent_seat: jnp.ndarray, wall_step_seed: jax.Array):
         def step_body(carry, step_idx):
@@ -114,7 +116,7 @@ def evaluate_duplicate_1v3(
         my_wind = init_wind[agent_seat]
         ahead = (scores > my_score) | ((scores == my_score) & (init_wind < my_wind))
         rank_idx = ahead.sum().astype(jnp.int32)  # 0=1st .. 3=4th
-        pt = rank_pts_arr[rank_idx]
+        pt = jnp.asarray(rank_pts_arr, dtype=jnp.float32)[rank_idx]
         finished = (final_state.terminated | final_state.truncated).astype(jnp.int32)
         return totals, rank_idx, pt, finished
 
@@ -123,23 +125,39 @@ def evaluate_duplicate_1v3(
         seats = jnp.arange(num_players, dtype=jnp.int32)
         return jax.vmap(lambda s: play_single_seat(init_state, s, wall_step_seed))(seats)
 
-    run_all = jax.jit(jax.vmap(play_duplicate_wall))
+    run_single_dev = jax.jit(jax.vmap(play_duplicate_wall))
+    n_devices = jax.local_device_count()
+    run_pmap = jax.pmap(jax.vmap(play_duplicate_wall)) if n_devices > 1 else None
 
     rng = jax.random.PRNGKey(cfg.seed)
     k_init, k_step = jax.random.split(rng)
     init_keys = jax.random.split(k_init, cfg.num_walls)
     step_seeds = jax.random.split(k_step, cfg.num_walls)
 
-    # Chunk walls to bound GPU VRAM cleanly (e.g., 8 walls = 32 concurrent games per chunk)
-    step_w = max(1, min(int(chunk_walls), int(cfg.num_walls)))
+    # Chunk walls across ALL local GPUs (`chunk_walls * n_devices` walls simultaneously!)
+    per_dev_w = max(1, min(int(chunk_walls), int(cfg.num_walls)))
+    step_w = per_dev_w * n_devices if run_pmap is not None else per_dev_w
     totals_list, ranks_list, pts_list, fin_list = [], [], [], []
     for start in range(0, cfg.num_walls, step_w):
         end = min(start + step_w, cfg.num_walls)
-        t_c, r_c, p_c, f_c = jax.device_get(run_all(init_keys[start:end], step_seeds[start:end]))
+        cnt = end - start
+        if run_pmap is not None and cnt >= n_devices and (cnt % n_devices == 0):
+            ik = shard_for_pmap(init_keys[start:end].reshape((n_devices, cnt // n_devices) + init_keys.shape[1:]), n_devices)
+            ss = shard_for_pmap(step_seeds[start:end].reshape((n_devices, cnt // n_devices) + step_seeds.shape[1:]), n_devices)
+            t_c, r_c, p_c, f_c = jax.device_get(run_pmap(ik, ss))
+            t_c = {k: np.asarray(v).reshape((cnt,) + np.asarray(v).shape[2:]) for k, v in t_c.items()}
+            r_c = np.asarray(r_c, dtype=np.int32).reshape((cnt, num_players))
+            p_c = np.asarray(p_c, dtype=np.float64).reshape((cnt, num_players))
+            f_c = np.asarray(f_c, dtype=np.float64).reshape((cnt, num_players))
+        else:
+            t_c, r_c, p_c, f_c = jax.device_get(run_single_dev(init_keys[start:end], step_seeds[start:end]))
+            r_c = np.asarray(r_c, dtype=np.int32)
+            p_c = np.asarray(p_c, dtype=np.float64)
+            f_c = np.asarray(f_c, dtype=np.float64)
         totals_list.append(t_c)
-        ranks_list.append(np.asarray(r_c, dtype=np.int32))
-        pts_list.append(np.asarray(p_c, dtype=np.float64))
-        fin_list.append(np.asarray(f_c, dtype=np.float64))
+        ranks_list.append(r_c)
+        pts_list.append(p_c)
+        fin_list.append(f_c)
 
     totals = {k: np.concatenate([np.asarray(t[k]) for t in totals_list], axis=0) for k in totals_list[0]}
     rank_idxs_np = np.concatenate(ranks_list, axis=0)

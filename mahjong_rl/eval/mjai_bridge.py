@@ -13,6 +13,7 @@ from typing import Any, Callable, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from mahjax.mahjong_4p.state import State
 from mahjong_rl.algo.legal_ron import compute_analytical_trinity, extract_table_snapshot
@@ -55,8 +56,19 @@ def make_v6_policy_actor(
         belief_t_cal: Post-training calibrated temperature `T_cal` for `B_EMA`.
         greedy: If True, returns argmax legal action; if False, samples from policy logits.
     """
-    w_tab = make_homogeneous_table(w_rule) if w_table_abs is None else jnp.asarray(w_table_abs, dtype=jnp.float32)
-    is_known_vec = jnp.full((3,), 1.0 if opp_rules_known else 0.0, dtype=jnp.float32)
+    # Keep closed-over weights device-agnostic (host NumPy) on multi-GPU so `jax.pmap`
+    # replicates them cleanly to every GPU without device-0 affinity conflicts!
+    if jax.local_device_count() > 1:
+        policy_params = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), policy_params)
+        belief_ema_params = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), belief_ema_params)
+        grp_base_params = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), grp_base_params)
+        w_tab = np.asarray(jax.device_get(make_homogeneous_table(w_rule) if w_table_abs is None else w_table_abs), dtype=np.float32)
+        w_rule_val = np.asarray(jax.device_get(w_rule), dtype=np.float32)
+        is_known_vec = np.full((3,), 1.0 if opp_rules_known else 0.0, dtype=np.float32)
+    else:
+        w_tab = make_homogeneous_table(w_rule) if w_table_abs is None else jnp.asarray(w_table_abs, dtype=jnp.float32)
+        w_rule_val = w_rule
+        is_known_vec = jnp.full((3,), 1.0 if opp_rules_known else 0.0, dtype=jnp.float32)
     grp_fn = lambda gf: grp_model.apply(grp_base_params, gf)
 
     def actor(state: State, key: jax.Array) -> jnp.ndarray:
@@ -73,7 +85,7 @@ def make_v6_policy_actor(
             is_known_vec,
             rng_key=None,
             dropout_prob=0.0,
-            w_table_default=w_rule,
+            w_table_default=w_rule_val,
         )
 
         b_out = belief_model.apply(

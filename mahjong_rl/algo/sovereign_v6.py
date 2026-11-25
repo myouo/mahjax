@@ -433,6 +433,32 @@ def ema_update_params(ema_params: Any, fast_params: Any, tau: float) -> Any:
     return jax.tree_util.tree_map(lambda e, f: (1.0 - t) * e + t * f, ema_params, fast_params)
 
 
+def _pmap_sharding(n_devices: int) -> jax.sharding.NamedSharding:
+    devices = jax.local_devices()[:n_devices]
+    return jax.sharding.NamedSharding(
+        jax.sharding.Mesh(np.array(devices), ("d",)),
+        jax.sharding.PartitionSpec("d"),
+    )
+
+
+def replicate_for_pmap(tree: Any, n_devices: int) -> Any:
+    """Replicate a PyTree onto `n_devices` with explicit leading-axis `NamedSharding` (JAX 0.4–0.12 safe)."""
+    sharding = _pmap_sharding(n_devices)
+
+    def _put(x):
+        a = np.asarray(jax.device_get(x))
+        b = np.broadcast_to(a, (n_devices,) + a.shape).copy()
+        return jax.device_put(b, sharding)
+
+    return jax.tree_util.tree_map(_put, tree)
+
+
+def shard_for_pmap(tree: Any, n_devices: int) -> Any:
+    """Place a leading-axis `(n_devices, ...)` PyTree across `n_devices` with explicit `NamedSharding`."""
+    sharding = _pmap_sharding(n_devices)
+    return jax.tree_util.tree_map(lambda x: jax.device_put(np.asarray(jax.device_get(x)), sharding), tree)
+
+
 # =============================================================================
 # 5. Calibration & Structural Health Metrics
 # =============================================================================

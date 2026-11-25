@@ -51,8 +51,10 @@ from mahjong_rl.algo.sovereign_v6 import (
     ema_update_params,
     init_running_rms,
     masked_categorical_log_probs,
+    replicate_for_pmap,
     reset_adam_first_moment_only,
     set_injected_lr,
+    shard_for_pmap,
     update_running_rms,
 )
 from mahjong_rl.algo.utility import (
@@ -128,8 +130,27 @@ def train_rl_v6(
     belief_t_cal: float = 1.0,
     grp_params_init: Optional[Any] = None,
     enable_self_healing: bool = True,
+    multi_gpu: bool = True,
 ) -> V6RLResult:
-    """Run Phase 1 (Frozen-Policy Warmup) + Phase 2 (Sovereign-Mahjong V6 RL)."""
+    """Run Phase 1 (Frozen-Policy Warmup) + Phase 2 (Sovereign-Mahjong V6 RL).
+
+    Automatically scales rollouts and gradient updates across ALL local GPUs via `jax.pmap`
+    when `multi_gpu=True` and `jax.local_device_count() > 1` (e.g., Kaggle T4x2).
+    """
+    n_devices = jax.local_device_count() if multi_gpu else 1
+    use_pmap = (
+        n_devices > 1
+        and (cfg.num_envs % n_devices == 0)
+        and (cfg.minibatch_size % n_devices == 0)
+    )
+    envs_per_dev = cfg.num_envs // n_devices if use_pmap else cfg.num_envs
+
+    def _rep(tree: Any) -> Any:
+        return replicate_for_pmap(tree, n_devices) if use_pmap else tree
+
+    def _unrep(tree: Any) -> Any:
+        return jax.tree_util.tree_map(lambda x: x[0], tree) if use_pmap else tree
+
     env = mahjax.make(
         cfg.env_name,
         round_mode=cfg.round_mode,
@@ -172,9 +193,17 @@ def train_rl_v6(
     rms_state: RunningRMSState = init_running_rms(1.0)
     w_tables, is_pfsp_env, learning_seat_mask = sample_meta_table_pool(cfg.num_envs, k_pool)
 
-    # Initialize parallel environments
+    # Initialize parallel environments (sharded across all GPUs if `use_pmap`)
     env_keys = jax.random.split(k_env, cfg.num_envs)
-    env_state = jax.jit(jax.vmap(env.init))(env_keys)
+    if use_pmap:
+        env_keys_s = shard_for_pmap(env_keys.reshape((n_devices, envs_per_dev) + env_keys.shape[1:]), n_devices)
+        env_state = jax.pmap(jax.vmap(env.init))(env_keys_s)
+        w_tables_exec = shard_for_pmap(w_tables.reshape((n_devices, envs_per_dev) + w_tables.shape[1:]), n_devices)
+        learn_mask_exec = shard_for_pmap(learning_seat_mask.reshape((n_devices, envs_per_dev) + learning_seat_mask.shape[1:]), n_devices)
+    else:
+        env_state = jax.jit(jax.vmap(env.init))(env_keys)
+        w_tables_exec = w_tables
+        learn_mask_exec = learning_seat_mask
 
     # PFSP elite pool (single-snapshot per rollout -> zero recompile!) + SD-TAP snapshot buffer
     pfsp_pool: Deque[Any] = deque(maxlen=max(1, int(cfg.rnad.pfsp_pool_size)))
@@ -185,10 +214,9 @@ def train_rl_v6(
     np_rng = np.random.default_rng(cfg.seed)
 
     # =========================================================================
-    # JIT 1: Vectorized Rollout (Per-Rollout Single-Snapshot PFSP, Zero Recompile!)
+    # JIT/PMAP 1: Vectorized Rollout (Per-Rollout Single-Snapshot PFSP, Zero Recompile!)
     # =========================================================================
-    @jax.jit
-    def rollout_fn(
+    def _rollout_single_dev(
         init_env_state,
         p_pi,
         p_opp,
@@ -346,7 +374,7 @@ def train_rl_v6(
         def scan_step(carry, _):
             st_b, r = carry
             r, k_sub = jax.random.split(r)
-            step_keys = jax.random.split(k_sub, cfg.num_envs)
+            step_keys = jax.random.split(k_sub, envs_per_dev)
             next_st_b, trans_b = jax.vmap(eval_single_env_step)(st_b, w_tab, learn_mask, step_keys)
             return (next_st_b, r), trans_b
 
@@ -388,14 +416,15 @@ def train_rl_v6(
             )
             return ora_out["probs_4x4"]
 
-        v_boot_b = jax.vmap(eval_bootstrap)(final_st_b, w_tab)  # (B, 4, 4)
+        v_boot_b = jax.vmap(eval_bootstrap)(final_st_b, w_tab)  # (envs_per_dev, 4, 4)
         return final_st_b, traj_tb, v_boot_b
 
+    rollout_fn = jax.pmap(_rollout_single_dev) if use_pmap else jax.jit(_rollout_single_dev)
+
     # =========================================================================
-    # JIT 2: Dual-Rate Simplex TD + Running-RMS + Sparse K_max Ron Labeling
+    # JIT/PMAP 2: Dual-Rate Simplex TD + Running-RMS + Sparse K_max Ron Labeling
     # =========================================================================
-    @jax.jit
-    def prepare_batch_fn(traj_tb, v_boot_b, rms_st):
+    def _prepare_single_dev(traj_tb, v_boot_b, rms_st):
         # Transpose (T, B, ...) -> (B, T, ...)
         traj_bt = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), traj_tb)
 
@@ -408,15 +437,15 @@ def train_rl_v6(
             round_ended=traj_bt["round_ended"],
             lambda_intra=cfg.rnad.lambda_intra,
             lambda_inter=cfg.rnad.lambda_inter,
-        )  # (B, T, 4, 4)
+        )  # (envs_per_dev, T, 4, 4)
 
         # Ego advantage: <(target - V_oracle)[cp], w_me>
-        b_idx = jnp.arange(cfg.num_envs, dtype=jnp.int32)[:, None]
+        b_idx = jnp.arange(envs_per_dev, dtype=jnp.int32)[:, None]
         t_idx = jnp.arange(cfg.num_steps, dtype=jnp.int32)[None, :]
         cp_bt = traj_bt["current_player"].astype(jnp.int32)
-        p_diff_me = targets_4x4[b_idx, t_idx, cp_bt] - traj_bt["v_oracle_4x4"][b_idx, t_idx, cp_bt]  # (B, T, 4)
-        w_me_bt = traj_bt["w_table_ego"][:, :, 0, :]  # (B, T, 4)
-        raw_adv = jnp.sum(p_diff_me * w_me_bt, axis=-1)  # (B, T)
+        p_diff_me = targets_4x4[b_idx, t_idx, cp_bt] - traj_bt["v_oracle_4x4"][b_idx, t_idx, cp_bt]
+        w_me_bt = traj_bt["w_table_ego"][:, :, 0, :]
+        raw_adv = jnp.sum(p_diff_me * w_me_bt, axis=-1)
 
         num_legal = jnp.sum(traj_bt["legal_mask"].astype(jnp.int32), axis=-1)
         active_mask = traj_bt["is_learn"] & (num_legal >= 2)
@@ -427,6 +456,11 @@ def train_rl_v6(
             beta=cfg.rnad.running_rms_beta,
             eps=cfg.rnad.running_rms_eps,
         )
+        if use_pmap:
+            synced_sq = jax.lax.pmean(new_rms.second_moment, axis_name="devices")
+            rms_val = jnp.sqrt(jnp.maximum(synced_sq, 0.0) + float(cfg.rnad.running_rms_eps))
+            scaled_adv = jnp.where(active_mask, raw_adv / rms_val, 0.0)
+            new_rms = RunningRMSState(second_moment=synced_sq, steps=new_rms.steps)
 
         win_ego, score_delta_ego, aux_valid = compute_round_outcome_targets(
             scores_curr=traj_bt["scores_curr"],
@@ -437,16 +471,15 @@ def train_rl_v6(
             current_players=cp_bt,
         )
 
-        # Flatten (B, T, ...) -> (N, ...)
-        n_total = cfg.num_envs * cfg.num_steps
-        flat = jax.tree_util.tree_map(lambda x: x.reshape((n_total,) + x.shape[2:]), traj_bt)
-        flat["targets_4x4"] = targets_4x4.reshape((n_total, 4, 4))
-        flat["adv_scaled"] = scaled_adv.reshape((n_total,))
-        flat["win_ego"] = win_ego.reshape((n_total,))
-        flat["score_delta_ego"] = score_delta_ego.reshape((n_total, 4))
-        flat["aux_valid"] = aux_valid.reshape((n_total,))
+        # Flatten (envs_per_dev, T, ...) -> (n_per_dev, ...)
+        n_per_dev = envs_per_dev * cfg.num_steps
+        flat = jax.tree_util.tree_map(lambda x: x.reshape((n_per_dev,) + x.shape[2:]), traj_bt)
+        flat["targets_4x4"] = targets_4x4.reshape((n_per_dev, 4, 4))
+        flat["adv_scaled"] = scaled_adv.reshape((n_per_dev,))
+        flat["win_ego"] = win_ego.reshape((n_per_dev,))
+        flat["score_delta_ego"] = score_delta_ego.reshape((n_per_dev, 4))
+        flat["aux_valid"] = aux_valid.reshape((n_per_dev,))
 
-        # Sparse K_max compacted legal-ron labeling (runs Yaku.judge ONLY on ~1.5% active slots!)
         y_ron, y_sb, y_ct, y_ten, _ = compute_sparse_belief_labels(
             flat["rsnap"], k_max=cfg.rnad.ron_k_max
         )
@@ -457,11 +490,14 @@ def train_rl_v6(
         del flat["rsnap"]
         return flat, new_rms, rms_val
 
+    prepare_batch_fn = (
+        jax.pmap(_prepare_single_dev, axis_name="devices") if use_pmap else jax.jit(_prepare_single_dev)
+    )
+
     # =========================================================================
-    # JIT 3: Isolated 3-Chain Minibatch Update (Warmup vs Full RL)
+    # JIT/PMAP 3: Isolated 3-Chain Minibatch Update (Warmup vs Full RL)
     # =========================================================================
     def _make_update_step(update_policy: bool):
-        @jax.jit
         def step_fn(
             p_pi,
             o_pi,
@@ -476,7 +512,6 @@ def train_rl_v6(
             shield_lam,
             t_cal,
         ):
-            # Recompute river_spatial_feat via frozen B_EMA for History-State Oracle
             b_ema_out = belief_net.apply(
                 p_b_ema,
                 planes=mb["planes"],
@@ -511,6 +546,8 @@ def train_rl_v6(
                 )
 
             (_, ora_metrics), g_ora = jax.value_and_grad(ora_loss_fn, has_aux=True)(p_ora)
+            if use_pmap:
+                g_ora = jax.lax.pmean(g_ora, axis_name="devices")
             u_ora, o_ora = tx_oracle.update(g_ora, o_ora, p_ora)
             p_ora = optax.apply_updates(p_ora, u_ora)
 
@@ -536,6 +573,8 @@ def train_rl_v6(
                 )
 
             (_, bel_metrics), g_bel = jax.value_and_grad(bel_loss_fn, has_aux=True)(p_b_fast)
+            if use_pmap:
+                g_bel = jax.lax.pmean(g_bel, axis_name="devices")
             u_bel, o_bel = tx_belief.update(g_bel, o_bel, p_b_fast)
             p_b_fast = optax.apply_updates(p_b_fast, u_bel)
             p_b_ema = ema_update_params(p_b_ema, p_b_fast, cfg.belief.ema_tau)
@@ -591,6 +630,8 @@ def train_rl_v6(
                     return loss, pm
 
                 (_, pi_metrics), g_pi = jax.value_and_grad(pi_loss_fn, has_aux=True)(p_pi)
+                if use_pmap:
+                    g_pi = jax.lax.pmean(g_pi, axis_name="devices")
                 u_pi, o_pi = tx_policy.update(g_pi, o_pi, p_pi)
                 p_pi = optax.apply_updates(p_pi, u_pi)
                 finite_all = finite_all & _tree_is_finite(g_pi)
@@ -609,9 +650,11 @@ def train_rl_v6(
                 }
 
             all_metrics = {**ora_metrics, **bel_metrics, **pi_metrics, "finite_grads": finite_all.astype(jnp.float32)}
+            if use_pmap:
+                all_metrics = jax.lax.pmean(all_metrics, axis_name="devices")
             return p_pi, o_pi, p_ora, o_ora, p_b_fast, o_bel, p_b_ema, all_metrics
 
-        return step_fn
+        return jax.pmap(step_fn, axis_name="devices") if use_pmap else jax.jit(step_fn)
 
     update_mb_warmup = _make_update_step(update_policy=False)
     update_mb_full = _make_update_step(update_policy=True)
@@ -620,23 +663,38 @@ def train_rl_v6(
     # Main Training Loop (Phase 1 Warmup -> Phase 2 Sovereign V6 RL)
     # =========================================================================
     n_total = cfg.num_envs * cfg.num_steps
-    mb_size = min(cfg.minibatch_size, n_total)
+    n_per_dev = envs_per_dev * cfg.num_steps
+    mb_per_dev = min(cfg.minibatch_size // n_devices if use_pmap else cfg.minibatch_size, n_per_dev)
     history: List[Dict[str, float]] = []
     steps_since_outer_reset = cfg.rnad.reset_warmup_steps
-    t_cal_arr = jnp.asarray(belief_t_cal, dtype=jnp.float32)
+    t_cal_arr = _rep(jnp.asarray(belief_t_cal, dtype=jnp.float32))
 
-    # Initial healthy checkpoint before updates
+    # Replicate states across all GPUs if multi-GPU `pmap` is active
+    params_pi = _rep(params_pi)
+    opt_pi = _rep(opt_pi)
+    params_oracle = _rep(params_oracle)
+    opt_oracle = _rep(opt_oracle)
+    params_b_fast = _rep(params_b_fast)
+    opt_belief = _rep(opt_belief)
+    params_b_ema = _rep(params_b_ema)
+    params_grp_base_exec = _rep(params_grp_base)
+    params_grp_ema_exec = _rep(params_grp_ema)
+    params_bc_exec = _rep(params_bc)
+    params_rho_base = _rep(params_rho_base)
+    rms_state = _rep(rms_state)
+
+    # Initial healthy checkpoint before updates (stored un-replicated on host)
     healer.save_checkpoint(
         0,
         {
-            "params_pi": params_pi,
-            "opt_pi": opt_pi,
-            "params_oracle": params_oracle,
-            "opt_oracle": opt_oracle,
-            "params_b_fast": params_b_fast,
-            "opt_belief": opt_belief,
-            "params_b_ema": params_b_ema,
-            "rms_state": rms_state,
+            "params_pi": _unrep(params_pi),
+            "opt_pi": _unrep(opt_pi),
+            "params_oracle": _unrep(params_oracle),
+            "opt_oracle": _unrep(opt_oracle),
+            "params_b_fast": _unrep(params_b_fast),
+            "opt_belief": _unrep(opt_belief),
+            "params_b_ema": _unrep(params_b_ema),
+            "rms_state": _unrep(rms_state),
         },
     )
 
@@ -647,12 +705,12 @@ def train_rl_v6(
 
         # Outer R-NaD hard reset at every `outer_reset_steps` in Phase 2
         if (not in_warmup) and phase2_step > 0 and (phase2_step % int(cfg.rnad.outer_reset_steps) == 0):
-            snap = _clone_params(params_pi)
+            snap = _clone_params(jax.device_get(_unrep(params_pi)))
             pfsp_pool.append(snap)
             outer_snapshots.append(snap)
-            params_rho_base = snap
+            params_rho_base = _rep(jax.device_put(snap))
             # Surgical AdamW reset: zero ONLY m_t, preserve 100% of v_t!
-            opt_pi = reset_adam_first_moment_only(opt_pi)
+            opt_pi = _rep(reset_adam_first_moment_only(_unrep(opt_pi)))
             steps_since_outer_reset = 0
 
         # Apply smooth post-reset warmup & self-healing LR scaling (zero recompile!)
@@ -662,48 +720,54 @@ def train_rl_v6(
         else:
             frac = 1.0
         eff_lr = float(cfg.rnad.policy_lr) * healer.current_lr_scale * frac
-        opt_pi = set_injected_lr(opt_pi, eff_lr)
+        opt_pi = _rep(set_injected_lr(_unrep(opt_pi), eff_lr))
 
         # Per-Rollout Single-Snapshot PFSP sampling (zero recompile!)
         opp_idx = int(np_rng.integers(0, len(pfsp_pool)))
-        params_opp = pfsp_pool[opp_idx]
+        params_opp = _rep(jax.device_put(pfsp_pool[opp_idx]))
 
         rng, k_roll = jax.random.split(rng)
+        k_roll_exec = shard_for_pmap(jax.random.split(k_roll, n_devices), n_devices) if use_pmap else k_roll
         env_state, traj_tb, v_boot_b = rollout_fn(
             env_state,
             params_pi,
             params_opp,
             params_b_ema,
-            params_grp_base,
-            params_grp_ema,
+            params_grp_base_exec,
+            params_grp_ema_exec,
             params_oracle,
-            w_tables,
-            learning_seat_mask,
+            w_tables_exec,
+            learn_mask_exec,
             t_cal_arr,
-            k_roll,
+            k_roll_exec,
         )
 
         # Structural deck uniqueness probe
-        decks_sig = np.asarray(jax.device_get(env_state.round_state.deck[:, :8]))
+        raw_decks = np.asarray(jax.device_get(env_state.round_state.deck))
+        decks_sig = raw_decks.reshape((cfg.num_envs, -1))[:, :8]
         distinct_ratio = len({row.tobytes() for row in decks_sig}) / max(cfg.num_envs, 1)
 
         flat_batch, rms_state, rms_val = prepare_batch_fn(traj_tb, v_boot_b, rms_state)
 
         progress = upd / max(cfg.num_updates - 1, 1)
-        shield_lam = jnp.asarray(compute_shield_lambda(progress, cfg.rnad), dtype=jnp.float32)
+        shield_lam_val = compute_shield_lambda(progress, cfg.rnad)
+        shield_lam = _rep(jnp.asarray(shield_lam_val, dtype=jnp.float32))
 
         step_fn = update_mb_warmup if in_warmup else update_mb_full
         upd_metrics_acc: Dict[str, List[float]] = {}
         all_finite = True
 
         for _ in range(cfg.update_epochs):
-            perm = np_rng.permutation(n_total)
-            for start in range(0, n_total, mb_size):
-                idx_np = perm[start : start + mb_size]
-                if idx_np.size < mb_size:
+            perm = np_rng.permutation(n_per_dev)
+            for start in range(0, n_per_dev, mb_per_dev):
+                idx_np = perm[start : start + mb_per_dev]
+                if idx_np.size < mb_per_dev:
                     continue
                 idx_j = jnp.asarray(idx_np, dtype=jnp.int32)
-                mb = jax.tree_util.tree_map(lambda x: x[idx_j], flat_batch)
+                if use_pmap:
+                    mb = jax.tree_util.tree_map(lambda x: x[:, idx_j], flat_batch)
+                else:
+                    mb = jax.tree_util.tree_map(lambda x: x[idx_j], flat_batch)
                 (
                     params_pi,
                     opt_pi,
@@ -721,15 +785,16 @@ def train_rl_v6(
                     params_b_fast,
                     opt_belief,
                     params_b_ema,
-                    params_bc,
+                    params_bc_exec,
                     params_rho_base,
                     mb,
                     shield_lam,
                     t_cal_arr,
                 )
-                if float(m_dict["finite_grads"]) < 0.5:
+                m_single = _unrep(m_dict)
+                if float(m_single["finite_grads"]) < 0.5:
                     all_finite = False
-                for mk, mv in m_dict.items():
+                for mk, mv in m_single.items():
                     upd_metrics_acc.setdefault(mk, []).append(float(mv))
 
         jax.block_until_ready(params_pi)
@@ -737,9 +802,9 @@ def train_rl_v6(
         summary = {
             "update": float(upd),
             "in_warmup": float(in_warmup),
-            "adv_rms": float(rms_val),
+            "adv_rms": float(_unrep(rms_val)),
             "eff_policy_lr": float(eff_lr),
-            "shield_lambda": float(shield_lam),
+            "shield_lambda": float(shield_lam_val),
             "distinct_deck_ratio": float(distinct_ratio),
             "update_wall_s": float(upd_wall_s),
             "sps": float(n_total / upd_wall_s),
@@ -758,44 +823,48 @@ def train_rl_v6(
             if report.action_taken == "rollback_and_halve_lr":
                 restored = healer.restore_latest()
                 if restored is not None:
-                    params_pi = restored["params_pi"]
-                    opt_pi = reset_adam_first_moment_only(restored["opt_pi"])
-                    params_oracle = restored["params_oracle"]
-                    opt_oracle = restored["opt_oracle"]
-                    params_b_fast = restored["params_b_fast"]
-                    opt_belief = restored["opt_belief"]
-                    params_b_ema = restored["params_b_ema"]
-                    rms_state = restored["rms_state"]
+                    params_pi = _rep(restored["params_pi"])
+                    opt_pi = _rep(reset_adam_first_moment_only(restored["opt_pi"]))
+                    params_oracle = _rep(restored["params_oracle"])
+                    opt_oracle = _rep(restored["opt_oracle"])
+                    params_b_fast = _rep(restored["params_b_fast"])
+                    opt_belief = _rep(restored["opt_belief"])
+                    params_b_ema = _rep(restored["params_b_ema"])
+                    rms_state = _rep(restored["rms_state"])
             elif report.healthy and ((upd + 1) % max(int(cfg.rnad.audit_interval), 1) == 0):
                 healer.save_checkpoint(
                     upd + 1,
                     {
-                        "params_pi": params_pi,
-                        "opt_pi": opt_pi,
-                        "params_oracle": params_oracle,
-                        "opt_oracle": opt_oracle,
-                        "params_b_fast": params_b_fast,
-                        "opt_belief": opt_belief,
-                        "params_b_ema": params_b_ema,
-                        "rms_state": rms_state,
+                        "params_pi": _unrep(params_pi),
+                        "opt_pi": _unrep(opt_pi),
+                        "params_oracle": _unrep(params_oracle),
+                        "opt_oracle": _unrep(opt_oracle),
+                        "params_b_fast": _unrep(params_b_fast),
+                        "opt_belief": _unrep(opt_belief),
+                        "params_b_ema": _unrep(params_b_ema),
+                        "rms_state": _unrep(rms_state),
                     },
                 )
         history.append(summary)
 
-    # Always append final policy to outer_snapshots for Phase 3 SD-TAP
-    outer_snapshots.append(_clone_params(params_pi))
+    # Unreplicate final weights onto device 0 / host cleanly
+    final_pi = jax.device_put(jax.device_get(_unrep(params_pi)), jax.local_devices()[0])
+    final_b_ema = jax.device_put(jax.device_get(_unrep(params_b_ema)), jax.local_devices()[0])
+    final_b_fast = jax.device_put(jax.device_get(_unrep(params_b_fast)), jax.local_devices()[0])
+    final_ora = jax.device_put(jax.device_get(_unrep(params_oracle)), jax.local_devices()[0])
+    outer_snapshots.append(_clone_params(final_pi))
 
     return V6RLResult(
         policy_model=policy_net,
-        policy_params=params_pi,
+        policy_params=final_pi,
         belief_model=belief_net,
-        belief_ema_params=params_b_ema,
-        belief_fast_params=params_b_fast,
+        belief_ema_params=final_b_ema,
+        belief_fast_params=final_b_fast,
         belief_t_cal=belief_t_cal,
         grp_model=grp_net,
         grp_base_params=params_grp_base,
         oracle_model=oracle_net,
-        oracle_params=params_oracle,
+        oracle_params=final_ora,
         outer_snapshots=outer_snapshots,
         history=history,
     )

@@ -1,10 +1,11 @@
 """Phase 0-C: Strictly Isomorphic Behavior Cloning of `SovereignPolicyNet`.
 
+Supports automatic multi-GPU Data-Parallel training (`jax.pmap` + `lax.pmean` across all
+`jax.local_device_count()` GPUs, e.g., Kaggle T4x2) with zero config changes!
 Architecture is 100% IDENTICAL between Phase 0-C BC and Phase 2 RL:
 - Frozen `B_EMA` (with calibrated `T_cal`) + frozen `GRP_base` compute exact analytical
   `Delta_U_ron`, `Delta_U_agari`, `Delta_U_ryuukyoku`, and `call_threat_plane` on-the-fly.
 - `beta_risk` and `beta_offense` are trained end-to-end from step 0 with zero weight decay!
-- Masked cross-entropy strictly skips forced moves (`num_legal <= 1`).
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ from mahjong_rl.algo.sovereign_v6 import (
     make_weight_decay_mask,
     masked_categorical_log_probs,
     masked_mean,
+    replicate_for_pmap,
+    shard_for_pmap,
 )
 from mahjong_rl.algo.utility import (
     W_PHOENIX_7D,
@@ -75,8 +78,8 @@ def _compute_batch_trinity(
     utility_dropout: float,
 ):
     w_ego_4x4 = jax.vmap(rotate_utility_matrix_ego)(batch["w_table_abs"], batch["current_player"])
-    w_me = w_ego_4x4[:, 0, :]     # (B, 4)
-    w_opp = w_ego_4x4[:, 1:, :]   # (B, 3, 4)
+    w_me = w_ego_4x4[:, 0, :]
+    w_opp = w_ego_4x4[:, 1:, :]
     is_known = jnp.ones((w_opp.shape[0], 3), dtype=jnp.float32)
     w_opp_5d = build_opponent_utility_features(w_opp, is_known, rng_key=rng_key, dropout_prob=utility_dropout)
 
@@ -140,6 +143,19 @@ def _compute_batch_trinity(
     return w_me, trinity
 
 
+def _replicate(tree: Any, n_devices: int) -> Any:
+    return replicate_for_pmap(tree, n_devices)
+
+
+def _shard_batch(batch_np: Dict[str, np.ndarray], keys: Sequence[str], n_devices: int) -> Dict[str, Any]:
+    out = {}
+    for k in keys:
+        a = batch_np[k]
+        per_dev = a.shape[0] // n_devices
+        out[k] = a[: per_dev * n_devices].reshape((n_devices, per_dev) + a.shape[1:])
+    return shard_for_pmap(out, n_devices)
+
+
 def train_bc(
     shard_paths: Sequence[Path | str],
     belief_model: BeliefNet,
@@ -148,8 +164,9 @@ def train_bc(
     grp_params: Any,
     cfg: BCConfig = BCConfig(),
     belief_t_cal: float = 1.0,
+    multi_gpu: bool = True,
 ) -> Tuple[SovereignPolicyNet, Any, List[Dict[str, float]]]:
-    """Train Phase 0-C strictly isomorphic `SovereignPolicyNet` via Behavior Cloning."""
+    """Train Phase 0-C strictly isomorphic `SovereignPolicyNet` (auto multi-GPU `pmap` if >1 GPU)."""
     model = SovereignPolicyNet(config=cfg.model)
     rng = jax.random.PRNGKey(cfg.seed)
     rng, k_init = jax.random.split(rng)
@@ -161,14 +178,16 @@ def train_bc(
     )
     opt_state = optimizer.init(params)
 
-    @jax.jit
-    def train_step(params, opt_state, batch, step_key):
+    n_devices = jax.local_device_count() if multi_gpu else 1
+    use_pmap = n_devices > 1 and (cfg.batch_size % n_devices == 0)
+
+    def _loss_and_grads(p, p_bel, p_grp, batch, step_key):
         w_me, (du_ron_3opp, du_ron_87, du_agari_3, du_ryu, call_threat) = _compute_batch_trinity(
             belief_model,
-            jax.lax.stop_gradient(belief_params),
+            jax.lax.stop_gradient(p_bel),
             belief_t_cal,
             grp_model,
-            jax.lax.stop_gradient(grp_params),
+            jax.lax.stop_gradient(p_grp),
             batch,
             rng_key=step_key,
             utility_dropout=cfg.utility_dropout,
@@ -177,9 +196,9 @@ def train_bc(
         actions = batch["action"].astype(jnp.int32)
         active = jnp.sum(mask.astype(jnp.int32), axis=-1) >= 2
 
-        def loss_fn(p):
+        def loss_fn(p_in):
             logits, aux = model.apply(
-                p,
+                p_in,
                 planes=batch["planes"],
                 delta_u_ron_3opp=jax.lax.stop_gradient(du_ron_3opp),
                 call_threat_plane=jax.lax.stop_gradient(call_threat),
@@ -211,10 +230,30 @@ def train_bc(
                 "beta_offense": aux["beta_offense"],
             }
 
-        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-        updates, opt_state = optimizer.update(grads, opt_state, params)
-        params = optax.apply_updates(params, updates)
-        return params, opt_state, metrics
+        (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(p)
+        return grads, metrics
+
+    if use_pmap:
+        def _pmap_step(p, o, p_bel, p_grp, batch, step_key):
+            grads, metrics = _loss_and_grads(p, p_bel, p_grp, batch, step_key)
+            grads = jax.lax.pmean(grads, axis_name="devices")
+            metrics = jax.lax.pmean(metrics, axis_name="devices")
+            updates, o = optimizer.update(grads, o, p)
+            p = optax.apply_updates(p, updates)
+            return p, o, metrics
+
+        train_step_pmap = jax.pmap(_pmap_step, axis_name="devices")
+        params_rep = _replicate(params, n_devices)
+        opt_rep = _replicate(opt_state, n_devices)
+        bel_rep = _replicate(belief_params, n_devices)
+        grp_rep = _replicate(grp_params, n_devices)
+    else:
+        @jax.jit
+        def train_step_jit(p, o, batch, step_key):
+            grads, metrics = _loss_and_grads(p, belief_params, grp_params, batch, step_key)
+            updates, o = optimizer.update(grads, o, p)
+            p = optax.apply_updates(p, updates)
+            return p, o, metrics
 
     history: List[Dict[str, float]] = []
     req_keys = (
@@ -250,16 +289,36 @@ def train_bc(
             keys=req_keys,
             seed=cfg.seed + epoch,
         )
-        ep_metrics: Dict[str, List[float]] = {}
+        ep_acc: Optional[Dict[str, jnp.ndarray]] = None
+        n_steps = 0
         for batch_np in loader:
             rng, k_step = jax.random.split(rng)
-            batch = {k: jnp.asarray(batch_np[k]) for k in req_keys}
-            params, opt_state, metrics = train_step(params, opt_state, batch, k_step)
-            for mk, mv in metrics.items():
-                ep_metrics.setdefault(mk, []).append(float(mv))
+            if use_pmap:
+                b_sharded = _shard_batch(batch_np, req_keys, n_devices)
+                dev_keys = shard_for_pmap(jax.random.split(k_step, n_devices), n_devices)
+                params_rep, opt_rep, metrics = train_step_pmap(
+                    params_rep, opt_rep, bel_rep, grp_rep, b_sharded, dev_keys
+                )
+                m_single = jax.tree_util.tree_map(lambda x: x[0], metrics)
+            else:
+                batch = {k: jnp.asarray(batch_np[k]) for k in req_keys}
+                params, opt_state, m_single = train_step_jit(params, opt_state, batch, k_step)
+
+            if ep_acc is None:
+                ep_acc = m_single
+            else:
+                ep_acc = jax.tree_util.tree_map(lambda a, b: a + b, ep_acc, m_single)
+            n_steps += 1
+
         summary = {"epoch": float(epoch)}
-        for mk, vals in ep_metrics.items():
-            summary[mk] = float(np.mean(vals)) if vals else 0.0
+        if ep_acc is not None and n_steps > 0:
+            ep_host = jax.device_get(ep_acc)
+            for mk, mv in ep_host.items():
+                summary[mk] = float(mv) / n_steps
         history.append(summary)
+
+    if use_pmap:
+        params = jax.device_get(jax.tree_util.tree_map(lambda x: x[0], params_rep))
+        params = jax.device_put(params, jax.local_devices()[0])
 
     return model, params, history

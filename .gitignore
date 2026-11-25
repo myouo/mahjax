@@ -30,6 +30,7 @@ tenhou
 tests/red_mahjong/assets
 tests/red_mahjong/test_replay.py
 logs/
-data/tenhou/
+data/
+checkpoints/
 params
 offline_data

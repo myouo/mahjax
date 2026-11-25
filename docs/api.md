@@ -262,7 +262,7 @@ Rollout each step records, for the agent that just acted:
 
 ```py
 Transition(
-    is_new_episode,           # 1 if this step is the first step of a fresh episode
+    done,                     # True on the LAST step of an episode (next_state.terminated | truncated)
     action,                   # what the acting player did
     value,                    # V(s_t) for the acting player's network
     reward,                   # 4-vector of rewards delivered at this step
@@ -273,21 +273,32 @@ Transition(
 )
 ```
 
-Backward scan to compute advantages: for each player keep a running accumulator. When we visit a step whose `current_player == p`, that's where player `p`'s next decision happens — we settle `p`'s accumulated reward into a single per-decision delta:
+Backward scan to compute advantages: for each player keep a running accumulator. When `transition.done` is `True` (the last step of an episode), clear the next episode's carry first so values and rewards never leak across episode boundaries, and mark `ep_ended = True` so every seat in that episode terminates cleanly with zero bootstrap:
 
 ```py
-def gae_backward(advantage_next, value_next, reward_accum, transition):
-    p = transition.current_player                # who acted at this step
-    reward_p = reward_accum[p] + transition.reward[p]  # everything p has accumulated since last on-turn
-    delta = reward_p + gamma * value_next * (1 - transition.is_new_episode) - transition.value
-    advantage = delta + gamma * gae_lambda * (1 - transition.is_new_episode) * advantage_next
+def gae_backward(carry, transition):
+    gae, next_value, reward_accum, has_next_value, ep_ended = carry
+    p, done = transition.current_player, transition.done
 
-    # Reset p's accumulator (consumed). Continue accumulating other players' rewards.
+    # Reset carry from the NEXT episode before processing the terminal step
+    gae = jnp.where(done, 0.0, gae)
+    next_value = jnp.where(done, 0.0, next_value)
+    reward_accum = jnp.where(done, 0.0, reward_accum)
+    has_next_value = jnp.where(done, False, has_next_value)
+    ep_ended = jnp.where(done, True, ep_ended)
+
+    reward_accum = reward_accum + transition.reward
+    reward_p = reward_accum[p]
     reward_accum = reward_accum.at[p].set(0.0)
-    reward_accum = reward_accum + transition.reward          # still owe other players
-    reward_accum = reward_accum.at[p].set(0.0)               # but not p again on this step
 
-    return advantage, value, reward_accum
+    is_valid = has_next_value[p] | ep_ended
+    delta = reward_p + gamma * next_value[p] - transition.value
+    advantage = jnp.where(is_valid, delta + gamma * gae_lambda * gae[p], 0.0)
+
+    gae = gae.at[p].set(advantage)
+    next_value = next_value.at[p].set(transition.value)
+    has_next_value = has_next_value.at[p].set(True)
+    return (gae, next_value, reward_accum, has_next_value, ep_ended), (advantage, is_valid)
 ```
 
 Round transitions under `auto` slot into this naturally:

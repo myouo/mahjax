@@ -29,6 +29,13 @@ dependencies = [
     "uvicorn>=0.39.0",
 ]
 
+[project.optional-dependencies]
+rl = [
+    "flax>=0.10.0",
+    "optax>=0.2.4",
+    "tqdm>=4.66.0",
+]
+
 [project.urls]
 "Documentation" = "https://nissymori.github.io/mahjax/"
 "Source" = "https://github.com/nissymori/mahjax"
@@ -38,7 +45,7 @@ version = { attr = "mahjax.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["mahjax*"]
+include = ["mahjax*", "mahjong_rl*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.svg", "*/*.svg"]

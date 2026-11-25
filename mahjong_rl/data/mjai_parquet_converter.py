@@ -901,6 +901,9 @@ def convert_mjai_parquets_to_v6_shards(
     total_rounds = max(stats["rounds_clean"] + stats["rounds_desync"], 1)
     result = {
         **stats,
+        "completed": True,
+        "max_games_requested": max_games,
+        "num_shards": len(written),
         "num_devices": n_devices,
         "global_batch": global_batch,
         "start_game": start_game,

@@ -161,17 +161,126 @@ def inspect_v6_shards(shard_dir: Path | str, verbose: bool = True) -> Dict[str, 
     return res
 
 
+def _is_v6_shard_filename(name: str) -> bool:
+    return (name.startswith("shard_") and name.endswith(".npz")) or name in ("manifest.json", "progress.json")
+
+
+def migrate_hf_root_shards_to_subdir(
+    repo_id: str,
+    *,
+    path_in_repo: str = "npz",
+    token: Optional[str] = None,
+    secret_name: str = "HF_TOKEN",
+    batch_size: int = 100,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Check a HF Dataset repo root for legacy V6 shards (`shard_*.npz`, `manifest.json`, `progress.json`)
+    and migrate them server-side into `<path_in_repo>/` (zero download for binary `.npz` LFS files!).
+    """
+    from huggingface_hub import (
+        CommitOperationAdd,
+        CommitOperationCopy,
+        CommitOperationDelete,
+        HfApi,
+        hf_hub_download,
+    )
+
+    subdir = path_in_repo.strip("/")
+    if not subdir:
+        return {"migrated": [], "dedup_deleted": [], "skipped": True}
+
+    tok = resolve_hf_token(token=token, secret_name=secret_name)
+    api = HfApi(token=tok)
+
+    try:
+        all_files = set(api.list_repo_files(repo_id=repo_id, repo_type="dataset"))
+    except Exception as exc:
+        print(f"[HF Migrate] Could not list {repo_id} ({type(exc).__name__}: {exc})")
+        return {"migrated": [], "dedup_deleted": [], "error": str(exc)}
+
+    root_targets = sorted(f for f in all_files if "/" not in f and _is_v6_shard_filename(f))
+    if not root_targets:
+        return {"migrated": [], "dedup_deleted": [], "clean": True}
+
+    if not tok:
+        raise RuntimeError(
+            f"Found {len(root_targets)} legacy root shard file(s) in {repo_id}, "
+            f"but no HF_TOKEN with write access was provided to migrate them into {subdir}/."
+        )
+
+    to_move: List[str] = []
+    to_dedup_delete: List[str] = []
+    for fname in root_targets:
+        dst_path = f"{subdir}/{fname}"
+        if dst_path in all_files:
+            to_dedup_delete.append(fname)
+        else:
+            to_move.append(fname)
+
+    print(
+        f"[HF Migrate] Found {len(root_targets)} root shard file(s) in {repo_id}: "
+        f"move -> {subdir}/ = {len(to_move)}, clean stale root duplicates = {len(to_dedup_delete)} "
+        f"(dry_run={dry_run})"
+    )
+    if dry_run:
+        return {"migrated": to_move, "dedup_deleted": to_dedup_delete, "dry_run": True}
+
+    # Build atomic operations: CommitOperationCopy for binary LFS `.npz`, CommitOperationAdd for small `.json`
+    ops: List[Any] = []
+    for fname in to_move:
+        dst_path = f"{subdir}/{fname}"
+        if fname.endswith(".npz"):
+            ops.append(CommitOperationCopy(src_path_in_repo=fname, path_in_repo=dst_path))
+            ops.append(CommitOperationDelete(path_in_repo=fname))
+        else:
+            local_json = hf_hub_download(
+                repo_id=repo_id, repo_type="dataset", filename=fname, token=tok
+            )
+            ops.append(CommitOperationAdd(path_in_repo=dst_path, path_or_fileobj=local_json))
+            ops.append(CommitOperationDelete(path_in_repo=fname))
+
+    for fname in to_dedup_delete:
+        ops.append(CommitOperationDelete(path_in_repo=fname))
+
+    # Commit in safe chunks (2 ops per moved file -> batch_size * 2 ops max per commit)
+    max_ops = max(2, int(batch_size) * 2)
+    n_commits = (len(ops) + max_ops - 1) // max_ops
+    for ci in range(n_commits):
+        chunk_ops = ops[ci * max_ops : (ci + 1) * max_ops]
+        api.create_commit(
+            repo_id=repo_id,
+            repo_type="dataset",
+            operations=chunk_ops,
+            commit_message=(
+                f"Migrate legacy root V6 shards into {subdir}/ "
+                f"(commit {ci + 1}/{n_commits})"
+            ),
+        )
+
+    print(
+        f"[HF Migrate DONE] Moved {len(to_move)} file(s) to {subdir}/ and removed "
+        f"{len(to_dedup_delete)} stale root duplicate(s) in {n_commits} commit(s)."
+    )
+    return {"migrated": to_move, "dedup_deleted": to_dedup_delete, "commits": n_commits}
+
+
 def upload_v6_shards_to_hf(
     shard_dir: Path | str,
     repo_id: str,
     *,
+    path_in_repo: str = "npz",
     private: bool = True,
     token: Optional[str] = None,
     secret_name: str = "HF_TOKEN",
-    use_large_folder_threshold: int = 200,
+    batch_size_shards: int = 150,
+    migrate_root: bool = True,
     commit_message: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Upload V6 `.npz` shards (`shard_*.npz`, `manifest.json`, `progress.json`) to a HF Dataset repo."""
+    """Upload V6 `.npz` shards (`shard_*.npz`, `manifest.json`, `progress.json`) into `<repo>/<path_in_repo>/`.
+
+    When `migrate_root=True` (default), automatically checks if any older shards were previously
+    uploaded to the repo root and migrates them server-side into `<path_in_repo>/` first.
+    """
     from huggingface_hub import HfApi
 
     d = Path(shard_dir)
@@ -187,71 +296,143 @@ def upload_v6_shards_to_hf(
             f"HF token required for upload! Bind Kaggle Secret '{secret_name}' or pass token=..."
         )
 
+    subdir = path_in_repo.strip("/")
     api = HfApi(token=tok)
     api.create_repo(repo_id=repo_id, repo_type="dataset", private=private, exist_ok=True)
 
+    if migrate_root and subdir:
+        migrate_hf_root_shards_to_subdir(
+            repo_id, path_in_repo=subdir, token=tok, secret_name=secret_name
+        )
+
     total_mb = sum(p.stat().st_size for p in shards) / (1024 ** 2)
-    patterns = ["shard_*.npz", "manifest.json", "progress.json"]
-    msg = commit_message or f"Sync {len(shards)} Sovereign-Mahjong V6 shards ({total_mb:.1f} MB)"
+    meta_files = [fn for fn in ("manifest.json", "progress.json") if (d / fn).exists()]
+    dest_label = f"https://huggingface.co/datasets/{repo_id}" + (f"/tree/main/{subdir}" if subdir else "")
 
     print(
         f"[HF Upload Shards] {len(shards)} shards ({total_mb:.1f} MB) -> "
-        f"https://huggingface.co/datasets/{repo_id} (private={private}) ..."
+        f"{dest_label} (private={private}) ..."
     )
-    if len(shards) >= use_large_folder_threshold and hasattr(api, "upload_large_folder"):
-        api.upload_large_folder(
-            folder_path=str(d),
-            repo_id=repo_id,
-            repo_type="dataset",
-            allow_patterns=patterns,
-        )
-    else:
+
+    if len(shards) <= batch_size_shards:
+        msg = commit_message or f"Sync {len(shards)} Sovereign-Mahjong V6 shards to {subdir or 'root'}/ ({total_mb:.1f} MB)"
         api.upload_folder(
             folder_path=str(d),
             repo_id=repo_id,
             repo_type="dataset",
-            allow_patterns=patterns,
+            path_in_repo=subdir or None,
+            allow_patterns=["shard_*.npz", "manifest.json", "progress.json"],
             commit_message=msg,
         )
-    url = f"https://huggingface.co/datasets/{repo_id}"
-    print(f"[HF Upload Shards DONE] {url}")
-    return {"repo_id": repo_id, "url": url, "num_shards": len(shards), "total_mb": round(total_mb, 2)}
+    else:
+        # Chunk large shard sets into clean commits while preserving `path_in_repo` across all HF Hub versions
+        n_chunks = (len(shards) + batch_size_shards - 1) // batch_size_shards
+        for ci in range(n_chunks):
+            chunk = shards[ci * batch_size_shards : (ci + 1) * batch_size_shards]
+            patterns = [p.name for p in chunk]
+            if ci == n_chunks - 1:
+                patterns.extend(meta_files)
+            msg = (
+                commit_message
+                or f"Sync Sovereign-Mahjong V6 shards batch {ci + 1}/{n_chunks} ({chunk[0].name}..{chunk[-1].name})"
+            )
+            print(f"  uploading batch {ci + 1}/{n_chunks} ({len(chunk)} shards) ...")
+            api.upload_folder(
+                folder_path=str(d),
+                repo_id=repo_id,
+                repo_type="dataset",
+                path_in_repo=subdir or None,
+                allow_patterns=patterns,
+                commit_message=msg,
+            )
+
+    print(f"[HF Upload Shards DONE] {dest_label}")
+    return {
+        "repo_id": repo_id,
+        "path_in_repo": subdir,
+        "url": dest_label,
+        "num_shards": len(shards),
+        "total_mb": round(total_mb, 2),
+    }
 
 
 def download_v6_shards_from_hf(
     repo_id: str,
     local_dir: Path | str,
     *,
+    path_in_repo: str = "npz",
     token: Optional[str] = None,
     secret_name: str = "HF_TOKEN",
     max_shards: Optional[int] = None,
+    migrate_root: bool = True,
 ) -> Dict[str, Any]:
-    """Download V6 `.npz` shards from a HF Dataset repo into `local_dir` (skips unchanged files)."""
+    """Download V6 `.npz` shards from `<repo>/<path_in_repo>/` into flat `local_dir` (skips existing shards).
+
+    When `migrate_root=True` and a write token is available, automatically migrates any legacy
+    root-level shards into `<path_in_repo>/` server-side before downloading.
+    """
     from huggingface_hub import snapshot_download
 
     dst = Path(local_dir)
     dst.mkdir(parents=True, exist_ok=True)
     tok = resolve_hf_token(token=token, secret_name=secret_name)
 
+    subdir = path_in_repo.strip("/")
+    if migrate_root and subdir and tok:
+        try:
+            migrate_hf_root_shards_to_subdir(
+                repo_id, path_in_repo=subdir, token=tok, secret_name=secret_name
+            )
+        except Exception as exc:
+            print(f"[HF Migrate] Skipped during download ({type(exc).__name__}: {exc})")
+
+    prefix = f"{subdir}/" if subdir else ""
+
     if max_shards is not None:
-        patterns: List[str] = [f"shard_{i:05d}.npz" for i in range(int(max_shards))] + [
-            "manifest.json",
-            "progress.json",
+        patterns: List[str] = [f"{prefix}shard_{i:05d}.npz" for i in range(int(max_shards))] + [
+            f"{prefix}manifest.json",
+            f"{prefix}progress.json",
         ]
     else:
-        patterns = ["shard_*.npz", "manifest.json", "progress.json"]
+        patterns = [f"{prefix}shard_*.npz", f"{prefix}manifest.json", f"{prefix}progress.json"]
 
+    # Skip shards already present and valid locally (always refresh manifest.json / progress.json)
+    ignore_patterns: List[str] = []
+    for p in sorted(dst.glob("shard_*.npz")):
+        try:
+            if _fast_shard_steps(p) > 0:
+                ignore_patterns.append(f"{prefix}{p.name}")
+        except Exception:
+            pass
+
+    src_label = f"https://huggingface.co/datasets/{repo_id}" + (f"/tree/main/{subdir}" if subdir else "")
     print(
-        f"[HF Download Shards] https://huggingface.co/datasets/{repo_id} -> {dst} "
-        f"(max_shards={max_shards or 'ALL'}) ..."
+        f"[HF Download Shards] {src_label} -> {dst} "
+        f"(max_shards={max_shards or 'ALL'}, skipping {len(ignore_patterns)} existing local shards) ..."
     )
-    snapshot_download(
-        repo_id=repo_id,
-        repo_type="dataset",
-        local_dir=str(dst),
-        allow_patterns=patterns,
-        token=tok,
-    )
+
+    stage_dir = dst / ".hf_dl_stage"
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type="dataset",
+            local_dir=str(stage_dir),
+            allow_patterns=patterns,
+            ignore_patterns=ignore_patterns or None,
+            token=tok,
+        )
+        src_root = (stage_dir / subdir) if subdir else stage_dir
+        if src_root.exists():
+            for fn in sorted(src_root.iterdir()):
+                if fn.is_file() and (
+                    (fn.name.startswith("shard_") and fn.name.endswith(".npz"))
+                    or fn.name in ("manifest.json", "progress.json")
+                ):
+                    shutil.move(str(fn), str(dst / fn.name))
+    finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
+
     return inspect_v6_shards(dst, verbose=True)
 
 

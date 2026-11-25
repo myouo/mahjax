@@ -34,7 +34,7 @@ import zipfile
 import jax
 import jax.numpy as jnp
 import numpy as np
-from numpy.lib.format import write_array
+from numpy.lib.format import read_array_header_1_0, read_array_header_2_0, read_magic, write_array
 import pyarrow.parquet as pq
 
 import mahjax
@@ -611,6 +611,163 @@ def _flush_shard_arrays(
     return path
 
 
+def _atomic_write_json(path: Path, payload: Dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.parent / f".{path.name}.tmp"
+    tmp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def _read_shard_num_steps(path: Path) -> int:
+    """Read the number of decision steps in a `.npz` shard from its `.npy` header without decompressing payload."""
+    with zipfile.ZipFile(path, mode="r") as zf:
+        with zf.open("action.npy", mode="r") as fh:
+            major, minor = read_magic(fh)
+            if (major, minor) == (1, 0):
+                shape, _, _ = read_array_header_1_0(fh)
+            else:
+                shape, _, _ = read_array_header_2_0(fh)
+    return int(shape[0])
+
+
+def _find_contiguous_valid_shards(out_dir: Path) -> List[Path]:
+    """Return contiguous `shard_00000.npz .. shard_{N-1:05d}.npz`, trimming any corrupted tail shard."""
+    if not out_dir.exists():
+        return []
+    for tmp in list(out_dir.glob(".shard_*.tmp.npz")) + list(out_dir.glob(".*.tmp")):
+        tmp.unlink(missing_ok=True)
+    shards: List[Path] = []
+    idx = 0
+    while True:
+        p = out_dir / f"shard_{idx:05d}.npz"
+        if not p.exists():
+            break
+        shards.append(p)
+        idx += 1
+    while shards:
+        tail = shards[-1]
+        try:
+            n_steps = _read_shard_num_steps(tail)
+            if n_steps > 0:
+                break
+        except Exception:
+            pass
+        tail.unlink(missing_ok=True)
+        shards.pop()
+    return shards
+
+
+def infer_resume_point_from_shards(
+    parquet_paths: Sequence[Path | str],
+    existing_shards: Sequence[Path],
+    *,
+    base_start_game: int = 0,
+    hanchan_only: bool = True,
+) -> Optional[Dict[str, object]]:
+    """Recover the exact parquet game offset from existing `.npz` shards that lack `progress.json`.
+
+    Inspects the last kyoku signature `(round_num, honba, kyotaku, dealer, scores, final_rank_perm)`
+    in the final existing shard and scans the parquet stream using a fast substring pre-filter (~20k games/s).
+    """
+    if not existing_shards:
+        return None
+    last_shard = existing_shards[-1]
+    with np.load(last_shard, allow_pickle=False) as d:
+        rn = np.asarray(d["table_round_num"], dtype=np.int32)
+        hb = np.asarray(d["table_honba"], dtype=np.int32)
+        ky = np.asarray(d["table_kyotaku"], dtype=np.int32)
+        dl = np.asarray(d["table_dealer"], dtype=np.int32)
+        sc = np.asarray(d["table_scores"], dtype=np.int32)
+        rm = np.asarray(d["final_rank_matrix_4x4"], dtype=np.float32)
+
+    if rn.size == 0:
+        return None
+
+    chg = np.concatenate(
+        [[True], (rn[1:] != rn[:-1]) | (hb[1:] != hb[:-1]) | (dl[1:] != dl[:-1])]
+    )
+    starts = np.nonzero(chg)[0]
+
+    # Build tail kyoku signatures (latest first)
+    tail_entries: List[Tuple[Tuple[int, int, int, int, Tuple[int, ...]], Tuple[int, ...], int]] = []
+    for pos_in_starts in range(len(starts) - 1, max(-1, len(starts) - 20), -1):
+        idx = int(starts[pos_in_starts])
+        scores_t = tuple(int(x) for x in sc[idx])
+        sig = (int(rn[idx]), int(hb[idx]), int(ky[idx]), int(dl[idx]), scores_t)
+        rm_perm = tuple(int(x) for x in np.argmax(rm[idx], axis=-1))
+        tail_entries.append((sig, rm_perm, pos_in_starts))
+
+    # Pick the latest kyoku with non-initial scores (globally unique when paired with rank permutation)
+    anchor_sig, anchor_rm, anchor_pos = tail_entries[0]
+    for sig, rm_perm, pos_in_starts in tail_entries:
+        if sig[4] != (250, 250, 250, 250) or sig[0] > 0 or sig[1] > 0:
+            anchor_sig, anchor_rm, anchor_pos = sig, rm_perm, pos_in_starts
+            break
+
+    # Count any new games started strictly after `anchor_pos` inside the final shard
+    extra_games = 0
+    for k in range(anchor_pos + 1, len(starts)):
+        idx = int(starts[k])
+        if int(rn[idx]) == 0 and int(hb[idx]) == 0 and tuple(int(x) for x in sc[idx]) == (250, 250, 250, 250):
+            extra_games += 1
+
+    s0_str = str(anchor_sig[4][0] * 100)
+    s1_str = str(anchor_sig[4][1] * 100)
+    s2_str = str(anchor_sig[4][2] * 100)
+
+    seen = 0
+    matched_seen: Optional[int] = None
+    for pq_path in parquet_paths:
+        pf = pq.ParquetFile(pq_path)
+        for batch in pf.iter_batches(batch_size=1024, columns=["kyoku_first", "aka_flag", "events"]):
+            kfs = batch.column("kyoku_first").to_pylist()
+            akas = batch.column("aka_flag").to_pylist()
+            evs_col = batch.column("events").to_pylist()
+            for kf, aka, ev_str in zip(kfs, akas, evs_col):
+                if hanchan_only and int(kf) != 0:
+                    continue
+                if not bool(aka):
+                    continue
+                seen += 1
+                if seen <= base_start_game:
+                    continue
+                if s0_str not in ev_str or s1_str not in ev_str or s2_str not in ev_str:
+                    continue
+                rounds = parse_mjai_game_to_rounds(ev_str)
+                for r in rounds:
+                    r_sig = (
+                        int(r.round_num),
+                        int(r.honba),
+                        int(r.kyotaku),
+                        int(r.dealer),
+                        tuple(int(x) for x in r.scores),
+                    )
+                    r_rm = tuple(int(x) for x in np.argmax(r.final_rank_matrix_4x4, axis=-1))
+                    if r_sig == anchor_sig and r_rm == anchor_rm:
+                        matched_seen = seen + extra_games
+                        break
+                if matched_seen is not None:
+                    break
+            if matched_seen is not None:
+                break
+        if matched_seen is not None:
+            break
+
+    if matched_seen is None:
+        return None
+
+    existing_steps = sum(_read_shard_num_steps(p) for p in existing_shards)
+    return {
+        "base_start_game": int(base_start_game),
+        "next_start_game": int(matched_seen),
+        "next_shard_idx": len(existing_shards),
+        "games_seen": int(matched_seen),
+        "games_processed": int(matched_seen - base_start_game),
+        "steps_written": int(existing_steps),
+        "shards_written": [str(p) for p in existing_shards],
+    }
+
+
 def convert_mjai_parquets_to_v6_shards(
     parquet_paths: Sequence[Path | str],
     out_dir: Path | str,
@@ -628,20 +785,29 @@ def convert_mjai_parquets_to_v6_shards(
     compress: bool = True,
     compresslevel: int = 3,
     multi_gpu: bool = True,
+    resume: bool = True,
     w_table_default: Optional[np.ndarray] = None,
     verbose: bool = True,
 ) -> Dict[str, object]:
     """Convert `hhim8826/tenhou-houou-mjai` Parquet files into ready-to-train V6 `.npz` shards.
 
-    Automatically utilizes ALL local GPUs via `jax.pmap` when `multi_gpu=True` and
-    `jax.local_device_count() > 1` (e.g., Kaggle T4x2 runs `2 * round_batch_size` kyokus in parallel!),
-    overlaps CPU parquet parsing via a prefetch thread, casts spatial planes to `float16` on GPU,
-    and writes compressed `.npz` shards asynchronously with fast zlib `compresslevel=1`.
+    Features:
+    - Multi-GPU `jax.pmap` across ALL local GPUs (`2 * per_dev_batch` on Kaggle T4x2).
+    - Whole-game aligned GPU batches & shards (zero games split across shards or train/val!).
+    - Atomic per-shard `progress.json` checkpointing + automatic `resume=True`:
+      1. Resumes seamlessly from `manifest.json` (e.g. if `max_games` was increased),
+      2. Resumes seamlessly from `progress.json` (if a previous run was interrupted),
+      3. Automatically rescues legacy partial shards lacking `progress.json` via exact
+         kyoku-fingerprint matching (`infer_resume_point_from_shards`) so existing shards
+         never need to be re-converted!
     """
     out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    manifest_path = out_path / "manifest.json"
+    progress_path = out_path / "progress.json"
+
     n_devices = jax.local_device_count() if multi_gpu else 1
     use_pmap = n_devices > 1
-    # `round_batch_size` is treated as total batch size when divisible by n_devices, or rounded up
     per_dev_batch = max(1, (int(round_batch_size) + n_devices - 1) // n_devices)
     global_batch = per_dev_batch * n_devices
 
@@ -650,6 +816,120 @@ def convert_mjai_parquets_to_v6_shards(
         if w_table_default is None
         else np.asarray(w_table_default, dtype=np.float32)
     )
+
+    # ------------------------------------------------------------------
+    # Check existing shards / manifest.json / progress.json for Resume
+    # ------------------------------------------------------------------
+    effective_start_game = int(start_game)
+    shard_idx = 0
+    written: List[Path] = []
+    stats = {
+        "games_seen": int(start_game),
+        "games_processed": 0,
+        "rounds_parsed": 0,
+        "rounds_clean": 0,
+        "rounds_desync": 0,
+        "steps_written": 0,
+        "pass_steps": 0,
+        "ron_overflow_batches": 0,
+    }
+
+    existing_shards = _find_contiguous_valid_shards(out_path)
+    resumed_from: Optional[str] = None
+
+    if resume and existing_shards:
+        loaded_state: Optional[Dict[str, object]] = None
+        if manifest_path.exists():
+            try:
+                m = json.loads(manifest_path.read_text(encoding="utf-8"))
+                m_start = int(m.get("start_game", 0))
+                m_shards = len(m.get("shards_written", []))
+                if m_start == int(start_game) and len(existing_shards) == m_shards and m_shards > 0:
+                    loaded_state = {
+                        "next_start_game": int(m.get("next_start_game", m_start + int(m.get("games_processed", 0)))),
+                        "next_shard_idx": m_shards,
+                        "games_seen": int(m.get("games_seen", m.get("next_start_game", 0))),
+                        "games_processed": int(m.get("games_processed", 0)),
+                        "rounds_parsed": int(m.get("rounds_parsed", 0)),
+                        "rounds_clean": int(m.get("rounds_clean", 0)),
+                        "rounds_desync": int(m.get("rounds_desync", 0)),
+                        "steps_written": int(m.get("steps_written", 0)),
+                        "pass_steps": int(m.get("pass_steps", 0)),
+                        "ron_overflow_batches": int(m.get("ron_overflow_batches", 0)),
+                    }
+                    resumed_from = "manifest.json"
+            except Exception:
+                loaded_state = None
+
+        if loaded_state is None and progress_path.exists():
+            try:
+                p = json.loads(progress_path.read_text(encoding="utf-8"))
+                p_start = int(p.get("start_game", 0))
+                p_next_idx = int(p.get("next_shard_idx", 0))
+                if p_start == int(start_game) and 0 < p_next_idx <= len(existing_shards):
+                    # Remove any uncheckpointed orphan shards beyond p_next_idx
+                    for extra in existing_shards[p_next_idx:]:
+                        extra.unlink(missing_ok=True)
+                    existing_shards = existing_shards[:p_next_idx]
+                    loaded_state = p
+                    resumed_from = "progress.json"
+            except Exception:
+                loaded_state = None
+
+        if loaded_state is None:
+            inferred = infer_resume_point_from_shards(
+                parquet_paths,
+                existing_shards,
+                base_start_game=int(start_game),
+                hanchan_only=hanchan_only,
+            )
+            if inferred is not None:
+                loaded_state = inferred
+                resumed_from = "kyoku-fingerprint (legacy partial shards)"
+
+        if loaded_state is not None:
+            effective_start_game = int(loaded_state["next_start_game"])
+            shard_idx = int(loaded_state["next_shard_idx"])
+            written = list(existing_shards[:shard_idx])
+            for k in stats:
+                if k in loaded_state:
+                    stats[k] = int(loaded_state[k])
+            if verbose:
+                print(
+                    f"[MJAI->V6 RESUME] source={resumed_from} | keeping {len(written)} existing shards "
+                    f"(games={stats['games_processed']}, steps={stats['steps_written']:,}) | "
+                    f"continuing from game #{effective_start_game} -> shard_{shard_idx:05d}.npz",
+                    flush=True,
+                )
+            if max_games is not None and stats["games_processed"] >= int(max_games):
+                total_rounds = max(stats["rounds_clean"] + stats["rounds_desync"], 1)
+                result = {
+                    **stats,
+                    "completed": True,
+                    "resumed_from": resumed_from,
+                    "max_games_requested": max_games,
+                    "num_shards": len(written),
+                    "num_devices": n_devices,
+                    "global_batch": global_batch,
+                    "start_game": int(start_game),
+                    "next_start_game": effective_start_game,
+                    "clean_round_rate": (
+                        stats["rounds_clean"] / total_rounds if (stats["rounds_clean"] + stats["rounds_desync"]) > 0 else 1.0
+                    ),
+                    "elapsed_s": 0.0,
+                    "games_per_sec": 0.0,
+                    "steps_per_sec": 0.0,
+                    "shards_written": [str(p) for p in written],
+                    "total_shard_mb": sum(p.stat().st_size for p in written) / (1024 ** 2),
+                }
+                _atomic_write_json(manifest_path, result)
+                progress_path.unlink(missing_ok=True)
+                return result
+    elif not resume and existing_shards:
+        for p in existing_shards:
+            p.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+        progress_path.unlink(missing_ok=True)
 
     # Scale per-device ron_k_max generously (80 * per_dev_batch guarantees 0 overflows!)
     per_dev_ron_k_max = max(int(ron_k_max), per_dev_batch * 80)
@@ -672,26 +952,27 @@ def convert_mjai_parquets_to_v6_shards(
 
     buf = _empty_shard_buf(include_oracle=include_oracle)
     buffered = 0
-    shard_idx = 0
-    written: List[Path] = []
-    pending_writes: List[Future[Path]] = []
+    pending_writes: List[Tuple[Future[Path], int, Dict[str, int]]] = []
     writer_pool = ThreadPoolExecutor(max_workers=4)
 
-    stats = {
-        "games_seen": 0,
-        "games_processed": 0,
-        "rounds_parsed": 0,
-        "rounds_clean": 0,
-        "rounds_desync": 0,
-        "steps_written": 0,
-        "pass_steps": 0,
-        "ron_overflow_batches": 0,
-    }
+    session_games_start = stats["games_processed"]
+    session_steps_start = stats["steps_written"]
     t0 = time.perf_counter()
 
     def _drain_writes(drain_all: bool = False) -> None:
         while pending_writes and (drain_all or len(pending_writes) >= 3):
-            written.append(pending_writes.pop(0).result())
+            fut, s_idx_done, snap_stats = pending_writes.pop(0)
+            p_written = fut.result()
+            written.append(p_written)
+            prog = {
+                **snap_stats,
+                "completed": False,
+                "start_game": int(start_game),
+                "next_start_game": int(snap_stats["games_seen"]),
+                "next_shard_idx": int(s_idx_done) + 1,
+                "shards_written": [str(p) for p in written],
+            }
+            _atomic_write_json(progress_path, prog)
 
     def _submit_shard() -> None:
         nonlocal buffered, shard_idx
@@ -704,37 +985,43 @@ def convert_mjai_parquets_to_v6_shards(
         s_idx = shard_idx
         shard_idx += 1
         buffered = 0
-        pending_writes.append(
-            writer_pool.submit(_flush_shard_arrays, out_path, s_idx, arrays, compress, compresslevel)
-        )
+        snap_stats = dict(stats)
+        fut = writer_pool.submit(_flush_shard_arrays, out_path, s_idx, arrays, compress, compresslevel)
+        pending_writes.append((fut, s_idx, snap_stats))
         if verbose:
             elapsed_now = max(time.perf_counter() - t0, 1e-6)
             tot_r = max(stats["rounds_clean"] + stats["rounds_desync"], 1)
+            sess_g = stats["games_processed"] - session_games_start
+            sess_s = stats["steps_written"] - session_steps_start
             eta_str = ""
-            if max_games is not None and stats["games_processed"] > 0:
-                rem_g = max(0, max_games - stats["games_processed"])
-                eta_s = rem_g / max(stats["games_processed"] / elapsed_now, 1e-6)
+            if max_games is not None and sess_g > 0:
+                rem_g = max(0, int(max_games) - stats["games_processed"])
+                eta_s = rem_g / max(sess_g / elapsed_now, 1e-6)
                 eta_str = f" ETA={eta_s/60:.1f}m"
             print(
                 f"[MJAI->V6] shard={s_idx:05d} games={stats['games_processed']}"
                 f"{f'/{max_games}' if max_games else ''} "
                 f"clean={stats['rounds_clean']}/{tot_r} ({100.0*stats['rounds_clean']/tot_r:.2f}%) "
-                f"steps={stats['steps_written']:,} ({stats['steps_written']/elapsed_now:.0f} steps/s) "
+                f"steps={stats['steps_written']:,} ({sess_s/elapsed_now:.0f} steps/s) "
                 f"overflow={stats['ron_overflow_batches']}{eta_str}",
                 flush=True,
             )
 
-    # Background producer thread: parses Parquet rows -> stacked NumPy round batches
+    # Background producer thread: packs WHOLE GAMES into GPU batches (<= global_batch rounds)
+    # so every shard boundary is an exact whole-game boundary with 0 leakage & exact resume!
     batch_queue: "queue.Queue[Optional[Tuple[List[ParsedRound], int, int, int]]]" = queue.Queue(maxsize=3)
     producer_err: List[BaseException] = []
+    remaining_games = None if max_games is None else max(0, int(max_games) - stats["games_processed"])
 
     def _producer() -> None:
         try:
-            pending: List[ParsedRound] = []
+            cur_batch: List[ParsedRound] = []
+            cur_games = 0
+            cur_rounds = 0
+            cur_last_seen = effective_start_game
             seen = 0
-            proc = 0
-            r_parsed = 0
-            stop = False
+            emitted_games = 0
+            stop = (remaining_games is not None and remaining_games <= 0)
             for pq_path in parquet_paths:
                 if stop:
                     break
@@ -749,31 +1036,49 @@ def convert_mjai_parquets_to_v6_shards(
                         if not bool(aka):
                             continue
                         seen += 1
-                        if seen <= start_game:
+                        if seen <= effective_start_game:
                             continue
                         rounds = parse_mjai_game_to_rounds(ev_str, max_events_per_round=max_events_per_round)
-                        proc += 1
-                        r_parsed += len(rounds)
-                        pending.extend(rounds)
-                        while len(pending) >= global_batch:
-                            batch_queue.put((pending[:global_batch], seen, proc, r_parsed))
-                            pending = pending[global_batch:]
-                        if max_games is not None and proc >= max_games:
+                        n_r = len(rounds)
+                        if cur_batch and (len(cur_batch) + n_r > global_batch):
+                            batch_queue.put((cur_batch, cur_last_seen, cur_games, cur_rounds))
+                            cur_batch = []
+                            cur_games = 0
+                            cur_rounds = 0
+                        if n_r > global_batch:
+                            # Extremely rare marathon game with > global_batch rounds
+                            for off in range(0, n_r, global_batch):
+                                sl = rounds[off : off + global_batch]
+                                is_last_sl = (off + global_batch >= n_r)
+                                batch_queue.put(
+                                    (sl, seen if is_last_sl else cur_last_seen, 1 if is_last_sl else 0, len(sl))
+                                )
+                            cur_last_seen = seen
+                        else:
+                            cur_batch.extend(rounds)
+                            cur_games += 1
+                            cur_rounds += n_r
+                            cur_last_seen = seen
+                        emitted_games += 1
+                        if remaining_games is not None and emitted_games >= remaining_games:
                             stop = True
                             break
                     if stop:
                         break
-            if pending:
-                batch_queue.put((pending, seen, proc, r_parsed))
+            if cur_batch:
+                batch_queue.put((cur_batch, cur_last_seen, cur_games, cur_rounds))
         except BaseException as exc:
             producer_err.append(exc)
         finally:
             batch_queue.put(None)
 
-    def _run_gpu_batch(batch_rounds: List[ParsedRound]) -> None:
+    def _run_gpu_batch(batch_rounds: List[ParsedRound], b_last_seen: int, b_games: int, b_rounds_parsed: int) -> None:
         nonlocal buffered
         actual_b = len(batch_rounds)
         if actual_b == 0:
+            stats["games_seen"] = b_last_seen
+            stats["games_processed"] += b_games
+            stats["rounds_parsed"] += b_rounds_parsed
             return
         padded = batch_rounds + [batch_rounds[-1]] * (global_batch - actual_b)
 
@@ -801,7 +1106,6 @@ def convert_mjai_parquets_to_v6_shards(
         ) = jax.device_get(out)
 
         if use_pmap:
-            # Merge `(n_devices, per_dev_batch, ...)` -> `(global_batch, ...)`
             def _merge(x):
                 a = np.asarray(x)
                 return a.reshape((global_batch,) + a.shape[2:])
@@ -827,6 +1131,9 @@ def convert_mjai_parquets_to_v6_shards(
 
         valid_mask = np.asarray(valid_mask[:actual_b], dtype=np.bool_)
         round_clean = np.asarray(round_clean[:actual_b], dtype=np.bool_)
+        stats["games_seen"] = b_last_seen
+        stats["games_processed"] += b_games
+        stats["rounds_parsed"] += b_rounds_parsed
         stats["rounds_clean"] += int(round_clean.sum())
         stats["rounds_desync"] += int((~round_clean).sum())
 
@@ -883,11 +1190,8 @@ def convert_mjai_parquets_to_v6_shards(
             item = batch_queue.get()
             if item is None:
                 break
-            b_rounds, seen, proc, r_parsed = item
-            stats["games_seen"] = seen
-            stats["games_processed"] = proc
-            stats["rounds_parsed"] = r_parsed
-            _run_gpu_batch(b_rounds)
+            b_rounds, b_last_seen, b_games, b_rounds_parsed = item
+            _run_gpu_batch(b_rounds, b_last_seen, b_games, b_rounds_parsed)
         prod_thread.join()
         if producer_err:
             raise producer_err[0]
@@ -899,24 +1203,27 @@ def convert_mjai_parquets_to_v6_shards(
 
     elapsed = max(time.perf_counter() - t0, 1e-6)
     total_rounds = max(stats["rounds_clean"] + stats["rounds_desync"], 1)
+    sess_games = stats["games_processed"] - session_games_start
+    sess_steps = stats["steps_written"] - session_steps_start
     result = {
         **stats,
         "completed": True,
+        "resumed_from": resumed_from,
         "max_games_requested": max_games,
         "num_shards": len(written),
         "num_devices": n_devices,
         "global_batch": global_batch,
-        "start_game": start_game,
+        "start_game": int(start_game),
         "next_start_game": stats["games_seen"],
         "clean_round_rate": stats["rounds_clean"] / total_rounds,
         "elapsed_s": elapsed,
-        "games_per_sec": stats["games_processed"] / elapsed,
-        "steps_per_sec": stats["steps_written"] / elapsed,
+        "games_per_sec": sess_games / elapsed,
+        "steps_per_sec": sess_steps / elapsed,
         "shards_written": [str(p) for p in written],
         "total_shard_mb": sum(p.stat().st_size for p in written) / (1024 ** 2),
     }
-    out_path.mkdir(parents=True, exist_ok=True)
-    (out_path / "manifest.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    _atomic_write_json(manifest_path, result)
+    progress_path.unlink(missing_ok=True)
     if verbose:
         print(
             f"[MJAI->V6 DONE] games={result['games_processed']} rounds={result['rounds_clean']}/{total_rounds} "
@@ -941,6 +1248,7 @@ def main() -> None:
     parser.add_argument("--compresslevel", type=int, default=1, help="zlib compression level (1=fastest, 6=default)")
     parser.add_argument("--no-compress", action="store_true", help="Write uncompressed .npz (fastest I/O)")
     parser.add_argument("--single-gpu", action="store_true", help="Disable multi-GPU pmap")
+    parser.add_argument("--no-resume", action="store_true", help="Ignore existing shards and start fresh")
     args = parser.parse_args()
 
     parquets = sorted(args.parquet_dir.glob("*.parquet"))
@@ -959,6 +1267,7 @@ def main() -> None:
         compress=not args.no_compress,
         compresslevel=args.compresslevel,
         multi_gpu=not args.single_gpu,
+        resume=not args.no_resume,
         verbose=True,
     )
 

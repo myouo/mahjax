@@ -909,6 +909,8 @@ def review_replay(
     if not parsed_rounds:
         raise ValueError("No valid kyokus could be parsed from replay.")
 
+    from mahjax.ui.rules import Rules
+    ui_rules = Rules("red_4p")
     env = mahjax.make("red_4p", round_mode="half", observe_type="dict", round_end="confirm")
     step_fn = jax.jit(env.step)
     eval_fn = _build_eval_step_fn(
@@ -924,6 +926,7 @@ def review_replay(
     dummy_key = jax.random.PRNGKey(0)
 
     decisions_by_seat: Dict[int, List[DecisionReview]] = {0: [], 1: [], 2: [], 3: []}
+    frames: List[Dict[str, Any]] = []
     desynced_rounds = 0
 
     for r_i, pr in enumerate(parsed_rounds):
@@ -1030,6 +1033,61 @@ def review_replay(
                     )
                 )
 
+                # Capture compact table snapshot for interactive NAGA/KillerDucky panel
+                dora_raw = np.asarray(st.round_state.dora_indicators, dtype=np.int32).tolist()
+                dora_vis = [int(x) for x in dora_raw if int(x) >= 0]
+                wall_rem = max(int(st.round_state.last_deck_ix) - int(st.round_state.next_deck_ix) + 1, 0)
+                cands = [
+                    {
+                        "a": int(a),
+                        "label": format_action_cn(int(a), last_draw=ld, target=tgt),
+                        "prob": round(float(probs[int(a)]), 4),
+                        "du_ron": round(float(du_ron[int(a)]), 4),
+                    }
+                    for a in order[:16]
+                ]
+                frames.append(
+                    {
+                        "idx": len(frames),
+                        "round_idx": r_i,
+                        "round_label": r_label,
+                        "dealer": int(st.round_state.dealer),
+                        "honba": int(st.round_state.honba),
+                        "kyotaku": int(st.round_state.kyotaku),
+                        "wall_rem": wall_rem,
+                        "dora": dora_vis,
+                        "turn": max(turn_counter[cp], 1),
+                        "seat": cp,
+                        "scores": ui_rules.scores(st),
+                        "riichi": [bool(st.players.riichi[p]) or bool(st.players.riichi_declared[p]) for p in range(4)],
+                        "hands": [ui_rules.hand_tiles(st, p) for p in range(4)],
+                        "rivers": [
+                            [[int(r["tile"]), int(r["riichi"]), int(r["called"]), int(r["tsumogiri"])] for r in ui_rules.river(st, p)]
+                            for p in range(4)
+                        ],
+                        "melds": [
+                            [{"kind": m["kind"], "tiles": [int(t) for t in m["tiles"]]} for m in ui_rules.melds(st, p)]
+                            for p in range(4)
+                        ],
+                        "last_draw": ld,
+                        "target": tgt,
+                        "is_discard": is_disc,
+                        "human_action": chosen_action,
+                        "human_action_str": format_action_cn(chosen_action, last_draw=ld, target=tgt),
+                        "human_prob": round(human_p, 4),
+                        "best_action": best_act,
+                        "best_action_str": format_action_cn(best_act, last_draw=ld, target=tgt),
+                        "best_prob": round(best_p, 4),
+                        "prob_ratio": round(ratio, 4),
+                        "matched_top1": (chosen_action == best_act),
+                        "is_blunder": (human_p < 0.05 and best_p >= 0.50),
+                        "candidates": cands,
+                        "delta_u_ron_human": round(float(du_ron[chosen_action]), 4),
+                        "delta_u_ron_best": round(float(du_ron[best_act]), 4),
+                        "p_tenpai": [round(float(x), 3) for x in p_tenpai.tolist()],
+                    }
+                )
+
             st = step_fn(st, jnp.int32(chosen_action), dummy_key)
 
     seats_report: Dict[str, Any] = {}
@@ -1052,6 +1110,7 @@ def review_replay(
         "rounds_desynced": desynced_rounds,
         "overall": _summarize_decisions(all_decisions, top_k_blunders=top_k_blunders),
         "seats": seats_report,
+        "frames": frames,
     }
 
 
@@ -1096,7 +1155,10 @@ def format_terminal_report(report: Dict[str, Any]) -> str:
 
 
 def render_html_report(report: Dict[str, Any]) -> str:
-    """Render a self-contained HTML review report inspired by Mortal / NAGA."""
+    """Render an interactive KillerDucky / mjai-reviewer / NAGA-style HTML review panel."""
+    if report.get("frames"):
+        from mahjong_rl.eval.review_panel import render_naga_panel_html
+        return render_naga_panel_html(report)
     seat_rows = []
     blunder_sections = []
     for s_key, s in report["seats"].items():

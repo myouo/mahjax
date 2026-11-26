@@ -1036,7 +1036,7 @@ def review_replay(
                 # Capture compact table snapshot for interactive NAGA/KillerDucky panel
                 dora_raw = np.asarray(st.round_state.dora_indicators, dtype=np.int32).tolist()
                 dora_vis = [int(x) for x in dora_raw if int(x) >= 0]
-                wall_rem = max(int(st.round_state.last_deck_ix) - int(st.round_state.next_deck_ix) + 1, 0)
+                wall_rem = max(int(st.round_state.next_deck_ix) - int(st.round_state.last_deck_ix) + 1, 0)
                 cands = [
                     {
                         "a": int(a),

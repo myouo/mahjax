@@ -1,5 +1,5 @@
 import "./style.css";
-import { getFilteredFrames, renderApp } from "./renderer";
+import { fitBoard, getFilteredFrames, mountShell, patchView } from "./renderer";
 import type { AppState, FilterMode, ReviewFrame, ReviewReport } from "./types";
 
 const root = document.getElementById("app")!;
@@ -13,6 +13,10 @@ const state: AppState = {
   quizAnswers: {},
   cursor: 0,
 };
+
+function update(): void {
+  patchView(state);
+}
 
 function loadReport(rep: ReviewReport): void {
   state.report = rep;
@@ -31,7 +35,7 @@ function setCursor(idx: number): void {
   update();
 }
 
-function jumpByPredicate(dir: 1 | -1, pred: (f: ReviewFrame) => boolean): boolean {
+function jumpBy(dir: 1 | -1, pred: (f: ReviewFrame) => boolean): boolean {
   const frames = getFilteredFrames(state);
   for (let i = state.cursor + dir; i >= 0 && i < frames.length; i += dir) {
     if (pred(frames[i])) {
@@ -44,32 +48,28 @@ function jumpByPredicate(dir: 1 | -1, pred: (f: ReviewFrame) => boolean): boolea
 }
 
 function jumpBlunder(dir: 1 | -1): void {
-  if (!jumpByPredicate(dir, (f) => f.is_blunder)) {
-    jumpByPredicate(dir, (f) => !f.matched_top1);
-  }
+  if (!jumpBy(dir, (f) => f.is_blunder)) jumpBy(dir, (f) => !f.matched_top1);
 }
 
 function jumpDiff(dir: 1 | -1): void {
-  jumpByPredicate(dir, (f) => !f.matched_top1);
+  jumpBy(dir, (f) => !f.matched_top1);
 }
 
 function jumpCall(dir: 1 | -1): void {
-  jumpByPredicate(dir, (f) => !f.is_discard || f.best_action >= 72 || f.human_action >= 72);
+  jumpBy(dir, (f) => !f.is_discard || f.best_action >= 72 || f.human_action >= 72);
 }
 
 function jumpRound(dir: 1 | -1): void {
   const frames = getFilteredFrames(state);
   if (!frames.length) return;
-  const curRound = frames[state.cursor].round_idx;
-  jumpByPredicate(dir, (f) => f.round_idx !== curRound);
+  const curR = frames[state.cursor].round_idx;
+  jumpBy(dir, (f) => f.round_idx !== curR);
 }
 
 function toggleAllOpponentHands(): void {
   const oppSeats = [0, 1, 2, 3].filter((p) => p !== state.seat);
   const allOn = oppSeats.every((p) => state.revealSeats[p]);
-  for (const p of oppSeats) {
-    state.revealSeats[p] = !allOn;
-  }
+  for (const p of oppSeats) state.revealSeats[p] = !allOn;
   update();
 }
 
@@ -78,13 +78,11 @@ function toggleQuizMode(): void {
   update();
 }
 
-/** Record answer once per frame.idx — cannot be re-answered or double-counted! */
 function submitQuizAnswer(actionId: number): void {
   const frames = getFilteredFrames(state);
   const f = frames[state.cursor];
   if (!f || !state.quizMode) return;
-  if (state.quizAnswers[f.idx] !== undefined) return; // Already answered -> locked!
-
+  if (state.quizAnswers[f.idx] !== undefined) return; // Locked once answered!
   state.quizAnswers[f.idx] = actionId;
   update();
 }
@@ -106,102 +104,94 @@ function handleFile(file: File): void {
   reader.readAsText(file, "utf-8");
 }
 
-function bindEvents(): void {
-  root.querySelectorAll<HTMLButtonElement>("[data-seat]").forEach((btn) => {
-    btn.onclick = () => {
-      state.seat = parseInt(btn.dataset.seat ?? "0", 10);
-      state.cursor = 0;
-      update();
-    };
-  });
+// Mount static shell ONCE and bind event delegation ONCE -> zero DOM thrashing!
+mountShell(root);
+fitBoard();
+window.addEventListener("resize", fitBoard);
 
-  root.querySelectorAll<HTMLElement>("[data-step]").forEach((el) => {
-    el.onclick = () => setCursor(parseInt(el.dataset.step ?? "0", 10));
-  });
+root.addEventListener("click", (e) => {
+  const target = e.target as HTMLElement | null;
+  if (!target) return;
 
-  root.querySelectorAll<HTMLElement>("[data-jump-idx]").forEach((item) => {
-    item.onclick = () => {
-      const targetIdx = parseInt(item.dataset.jumpIdx ?? "-1", 10);
-      state.filter = "all";
-      const frames = getFilteredFrames(state);
-      const pos = frames.findIndex((f) => f.idx === targetIdx);
-      if (pos >= 0) {
-        state.cursor = pos;
-        update();
-      }
-    };
-  });
-
-  // Per-opponent hand reveal/hide click
-  root.querySelectorAll<HTMLElement>("[data-toggle-seat]").forEach((zone) => {
-    zone.onclick = (e) => {
-      e.stopPropagation();
-      const s = parseInt(zone.dataset.toggleSeat ?? "-1", 10);
-      if (s >= 0 && s < 4) {
-        state.revealSeats[s] = !state.revealSeats[s];
-        update();
-      }
-    };
-  });
-
-  // Quiz mode clicks (hand tiles or call/riichi/PASS buttons)
-  root.querySelectorAll<HTMLElement>("[data-quiz-action]").forEach((el) => {
-    el.onclick = () => {
-      const act = parseInt(el.dataset.quizAction ?? "-1", 10);
-      if (act >= 0) submitQuizAnswer(act);
-    };
-  });
-
-  const filterSel = root.querySelector<HTMLSelectElement>("#filterSelect");
-  if (filterSel) {
-    filterSel.onchange = () => {
-      state.filter = filterSel.value as FilterMode;
-      state.cursor = 0;
-      update();
-    };
-  }
-
-  const bindClick = (id: string, fn: () => void) => {
-    const el = root.querySelector<HTMLButtonElement>(id);
-    if (el) el.onclick = fn;
-  };
-  bindClick("#quizBtn", toggleQuizMode);
-  bindClick("#handsToggleBtn", toggleAllOpponentHands);
-  bindClick("#resetQuizBtn", () => {
+  const quizReset = target.closest<HTMLElement>("#resetQuizBtn");
+  if (quizReset) {
     state.quizAnswers = {};
     update();
-  });
-  bindClick("#prevStepBtn", () => setCursor(state.cursor - 1));
-  bindClick("#nextStepBtn", () => setCursor(state.cursor + 1));
-  bindClick("#prevDiffBtn", () => jumpDiff(-1));
-  bindClick("#nextDiffBtn", () => jumpDiff(1));
-  bindClick("#prevBlunderBtn", () => jumpBlunder(-1));
-  bindClick("#nextBlunderBtn", () => jumpBlunder(1));
-  bindClick("#nextCallBtn", () => jumpCall(1));
-  bindClick("#prevRoundBtn", () => jumpRound(-1));
-  bindClick("#nextRoundBtn", () => jumpRound(1));
+    return;
+  }
 
-  root.querySelectorAll<HTMLInputElement>("#fileInput, #fileInputEmpty").forEach((inp) => {
-    inp.onchange = () => {
-      const f = inp.files?.[0];
-      if (f) handleFile(f);
-    };
-  });
-}
+  const seatBtn = target.closest<HTMLElement>("[data-seat]");
+  if (seatBtn) {
+    state.seat = parseInt(seatBtn.dataset.seat ?? "0", 10);
+    state.cursor = 0;
+    update();
+    return;
+  }
 
-function update(): void {
-  // Preserve scroll positions of scrollable lists to prevent visual jump
-  const oldBlunderScroll = root.querySelector(".blunder-list")?.scrollTop ?? 0;
-  const oldRoundScroll = root.querySelector(".round-strip")?.scrollLeft ?? 0;
-  renderApp(root, state);
-  bindEvents();
-  const newBlunder = root.querySelector(".blunder-list");
-  if (newBlunder) newBlunder.scrollTop = oldBlunderScroll;
-  const newRound = root.querySelector(".round-strip");
-  if (newRound) newRound.scrollLeft = oldRoundScroll;
-}
+  const stepEl = target.closest<HTMLElement>("[data-step]");
+  if (stepEl) {
+    setCursor(parseInt(stepEl.dataset.step ?? "0", 10));
+    return;
+  }
 
-// Keyboard shortcuts (KillerDucky / Mortal style)
+  const jumpEl = target.closest<HTMLElement>("[data-jump-idx]");
+  if (jumpEl) {
+    const idx = parseInt(jumpEl.dataset.jumpIdx ?? "-1", 10);
+    state.filter = "all";
+    const frames = getFilteredFrames(state);
+    const pos = frames.findIndex((f) => f.idx === idx);
+    if (pos >= 0) setCursor(pos);
+    return;
+  }
+
+  const toggleSeatEl = target.closest<HTMLElement>("[data-toggle-seat]");
+  if (toggleSeatEl) {
+    const s = parseInt(toggleSeatEl.dataset.toggleSeat ?? "-1", 10);
+    if (s >= 0 && s < 4) {
+      state.revealSeats[s] = !state.revealSeats[s];
+      update();
+    }
+    return;
+  }
+
+  const quizActEl = target.closest<HTMLElement>("[data-quiz-action]");
+  if (quizActEl) {
+    const act = parseInt(quizActEl.dataset.quizAction ?? "-1", 10);
+    if (act >= 0) submitQuizAnswer(act);
+    return;
+  }
+
+  const btn = target.closest<HTMLButtonElement>("button");
+  if (!btn) return;
+  switch (btn.id) {
+    case "quizBtn": toggleQuizMode(); break;
+    case "handsToggleBtn": toggleAllOpponentHands(); break;
+    case "prevStepBtn": setCursor(state.cursor - 1); break;
+    case "nextStepBtn": setCursor(state.cursor + 1); break;
+    case "prevDiffBtn": jumpDiff(-1); break;
+    case "nextDiffBtn": jumpDiff(1); break;
+    case "prevBlunderBtn": jumpBlunder(-1); break;
+    case "nextBlunderBtn": jumpBlunder(1); break;
+    case "nextCallBtn": jumpCall(1); break;
+    case "prevRoundBtn": jumpRound(-1); break;
+    case "nextRoundBtn": jumpRound(1); break;
+  }
+});
+
+root.addEventListener("change", (e) => {
+  const target = e.target as HTMLElement | null;
+  if (!target) return;
+  if (target.id === "filterSelect") {
+    state.filter = (target as HTMLSelectElement).value as FilterMode;
+    state.cursor = 0;
+    update();
+  } else if (target.id === "fileInput") {
+    const f = (target as HTMLInputElement).files?.[0];
+    if (f) handleFile(f);
+  }
+});
+
+// Keyboard shortcuts
 document.addEventListener("keydown", (e) => {
   const tag = (e.target as HTMLElement | null)?.tagName;
   if (tag === "SELECT" || tag === "INPUT") return;
@@ -236,9 +226,7 @@ window.addEventListener("dragover", (e) => {
   e.preventDefault();
   document.body.classList.add("drag-over");
 });
-window.addEventListener("dragleave", () => {
-  document.body.classList.remove("drag-over");
-});
+window.addEventListener("dragleave", () => document.body.classList.remove("drag-over"));
 window.addEventListener("drop", (e) => {
   e.preventDefault();
   document.body.classList.remove("drag-over");
@@ -247,19 +235,16 @@ window.addEventListener("drop", (e) => {
 });
 
 async function boot(): Promise<void> {
-  update();
   const params = new URLSearchParams(window.location.search);
   const fileUrl = params.get("file") || "./sample_b70ecabe.json";
   try {
     const resp = await fetch(fileUrl);
     if (resp.ok) {
       const rep = (await resp.json()) as ReviewReport;
-      if (rep.frames && rep.seats) {
-        loadReport(rep);
-      }
+      if (rep.frames && rep.seats) loadReport(rep);
     }
   } catch {
-    // Wait for user file upload / drag-and-drop
+    // Wait for drag-and-drop JSON
   }
 }
 

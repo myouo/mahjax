@@ -1,6 +1,6 @@
 import "./style.css";
 import { getFilteredFrames, renderApp } from "./renderer";
-import type { AppState, FilterMode, ReviewReport } from "./types";
+import type { AppState, FilterMode, ReviewFrame, ReviewReport } from "./types";
 
 const root = document.getElementById("app")!;
 
@@ -8,7 +8,10 @@ const state: AppState = {
   report: null,
   seat: 0,
   filter: "all",
-  xray: false,
+  revealSeats: [false, false, false, false],
+  quizMode: false,
+  quizAnsweredAction: null,
+  quizStats: { answered: 0, matched: 0, ratingSum: 0 },
   cursor: 0,
 };
 
@@ -18,45 +21,85 @@ function loadReport(rep: ReviewReport): void {
   state.seat = firstSeat !== undefined ? parseInt(firstSeat, 10) : 0;
   state.filter = "all";
   state.cursor = 0;
+  state.quizAnsweredAction = null;
   update();
 }
 
 function setCursor(idx: number): void {
   const frames = getFilteredFrames(state);
   if (!frames.length) return;
-  state.cursor = Math.max(0, Math.min(idx, frames.length - 1));
+  const next = Math.max(0, Math.min(idx, frames.length - 1));
+  if (next !== state.cursor) {
+    state.cursor = next;
+    state.quizAnsweredAction = null;
+  }
   update();
 }
 
-function jumpBlunder(dir: 1 | -1): void {
+function jumpByPredicate(dir: 1 | -1, pred: (f: ReviewFrame) => boolean): boolean {
   const frames = getFilteredFrames(state);
   for (let i = state.cursor + dir; i >= 0 && i < frames.length; i += dir) {
-    if (frames[i].is_blunder) {
+    if (pred(frames[i])) {
       state.cursor = i;
+      state.quizAnsweredAction = null;
       update();
-      return;
+      return true;
     }
   }
-  for (let i = state.cursor + dir; i >= 0 && i < frames.length; i += dir) {
-    if (!frames[i].matched_top1) {
-      state.cursor = i;
-      update();
-      return;
-    }
+  return false;
+}
+
+function jumpBlunder(dir: 1 | -1): void {
+  if (!jumpByPredicate(dir, (f) => f.is_blunder)) {
+    jumpByPredicate(dir, (f) => !f.matched_top1);
   }
+}
+
+function jumpDiff(dir: 1 | -1): void {
+  jumpByPredicate(dir, (f) => !f.matched_top1);
+}
+
+function jumpCall(dir: 1 | -1): void {
+  jumpByPredicate(dir, (f) => !f.is_discard || f.best_action >= 72 || f.human_action >= 72);
 }
 
 function jumpRound(dir: 1 | -1): void {
   const frames = getFilteredFrames(state);
   if (!frames.length) return;
   const curRound = frames[state.cursor].round_idx;
-  for (let i = state.cursor + dir; i >= 0 && i < frames.length; i += dir) {
-    if (frames[i].round_idx !== curRound) {
-      state.cursor = i;
-      update();
-      return;
-    }
+  jumpByPredicate(dir, (f) => f.round_idx !== curRound);
+}
+
+function toggleAllOpponentHands(): void {
+  const oppSeats = [0, 1, 2, 3].filter((p) => p !== state.seat);
+  const allOn = oppSeats.every((p) => state.revealSeats[p]);
+  for (const p of oppSeats) {
+    state.revealSeats[p] = !allOn;
   }
+  update();
+}
+
+function toggleQuizMode(): void {
+  state.quizMode = !state.quizMode;
+  state.quizAnsweredAction = null;
+  update();
+}
+
+function submitQuizAnswer(actionId: number): void {
+  const frames = getFilteredFrames(state);
+  const f = frames[state.cursor];
+  if (!f || !state.quizMode || state.quizAnsweredAction !== null) return;
+
+  state.quizAnsweredAction = actionId;
+  const cand = (f.candidates ?? []).find((c) => c.a === actionId);
+  const pickedProb = cand ? cand.prob : 0;
+  const ratio = Math.min(1, pickedProb / Math.max(f.best_prob, 1e-6));
+  const isMatch = actionId === f.best_action;
+
+  state.quizStats.answered += 1;
+  if (isMatch) state.quizStats.matched += 1;
+  state.quizStats.ratingSum += ratio * 100;
+  update();
 }
 
 function handleFile(file: File): void {
@@ -81,12 +124,13 @@ function bindEvents(): void {
     btn.onclick = () => {
       state.seat = parseInt(btn.dataset.seat ?? "0", 10);
       state.cursor = 0;
+      state.quizAnsweredAction = null;
       update();
     };
   });
 
-  root.querySelectorAll<HTMLElement>("[data-step]").forEach((dot) => {
-    dot.onclick = () => setCursor(parseInt(dot.dataset.step ?? "0", 10));
+  root.querySelectorAll<HTMLElement>("[data-step]").forEach((el) => {
+    el.onclick = () => setCursor(parseInt(el.dataset.step ?? "0", 10));
   });
 
   root.querySelectorAll<HTMLElement>("[data-jump-idx]").forEach((item) => {
@@ -97,29 +141,37 @@ function bindEvents(): void {
       const pos = frames.findIndex((f) => f.idx === targetIdx);
       if (pos >= 0) {
         state.cursor = pos;
+        state.quizAnsweredAction = null;
         update();
       }
     };
   });
 
-  const roundSel = root.querySelector<HTMLSelectElement>("#roundSelect");
-  if (roundSel) {
-    roundSel.onchange = () => setCursor(parseInt(roundSel.value, 10) || 0);
-  }
+  // Per-opponent hand reveal/hide click
+  root.querySelectorAll<HTMLElement>("[data-toggle-seat]").forEach((zone) => {
+    zone.onclick = () => {
+      const s = parseInt(zone.dataset.toggleSeat ?? "-1", 10);
+      if (s >= 0 && s < 4) {
+        state.revealSeats[s] = !state.revealSeats[s];
+        update();
+      }
+    };
+  });
+
+  // Quiz mode clicks (hand tiles or call/riichi/PASS buttons)
+  root.querySelectorAll<HTMLElement>("[data-quiz-action]").forEach((el) => {
+    el.onclick = () => {
+      const act = parseInt(el.dataset.quizAction ?? "-1", 10);
+      if (act >= 0) submitQuizAnswer(act);
+    };
+  });
 
   const filterSel = root.querySelector<HTMLSelectElement>("#filterSelect");
   if (filterSel) {
     filterSel.onchange = () => {
       state.filter = filterSel.value as FilterMode;
       state.cursor = 0;
-      update();
-    };
-  }
-
-  const xrayBtn = root.querySelector<HTMLButtonElement>("#xrayBtn");
-  if (xrayBtn) {
-    xrayBtn.onclick = () => {
-      state.xray = !state.xray;
+      state.quizAnsweredAction = null;
       update();
     };
   }
@@ -128,10 +180,20 @@ function bindEvents(): void {
     const el = root.querySelector<HTMLButtonElement>(id);
     if (el) el.onclick = fn;
   };
+  bindClick("#quizBtn", toggleQuizMode);
+  bindClick("#handsToggleBtn", toggleAllOpponentHands);
+  bindClick("#resetQuizBtn", () => {
+    state.quizStats = { answered: 0, matched: 0, ratingSum: 0 };
+    state.quizAnsweredAction = null;
+    update();
+  });
   bindClick("#prevStepBtn", () => setCursor(state.cursor - 1));
   bindClick("#nextStepBtn", () => setCursor(state.cursor + 1));
+  bindClick("#prevDiffBtn", () => jumpDiff(-1));
+  bindClick("#nextDiffBtn", () => jumpDiff(1));
   bindClick("#prevBlunderBtn", () => jumpBlunder(-1));
   bindClick("#nextBlunderBtn", () => jumpBlunder(1));
+  bindClick("#nextCallBtn", () => jumpCall(1));
   bindClick("#prevRoundBtn", () => jumpRound(-1));
   bindClick("#nextRoundBtn", () => jumpRound(1));
 
@@ -148,7 +210,7 @@ function update(): void {
   bindEvents();
 }
 
-// Keyboard shortcuts
+// Keyboard shortcuts (KillerDucky / Mortal style)
 document.addEventListener("keydown", (e) => {
   const tag = (e.target as HTMLElement | null)?.tagName;
   if (tag === "SELECT" || tag === "INPUT") return;
@@ -162,14 +224,18 @@ document.addEventListener("keydown", (e) => {
   } else if (e.key === "ArrowDown") {
     e.preventDefault();
     jumpBlunder(1);
-  } else if (e.key === "x" || e.key === "X") {
-    state.xray = !state.xray;
-    update();
-  } else if (["1", "2", "3", "4"].includes(e.key) && state.report) {
+  } else if (e.key === "[") jumpDiff(-1);
+  else if (e.key === "]") jumpDiff(1);
+  else if (e.key === "c" || e.key === "C") jumpCall(-1);
+  else if (e.key === "v" || e.key === "V") jumpCall(1);
+  else if (e.key === "h" || e.key === "H") toggleAllOpponentHands();
+  else if (e.key === "q" || e.key === "Q") toggleQuizMode();
+  else if (["1", "2", "3", "4"].includes(e.key) && state.report) {
     const s = parseInt(e.key, 10) - 1;
     if (state.report.seats[String(s)]) {
       state.seat = s;
       state.cursor = 0;
+      state.quizAnsweredAction = null;
       update();
     }
   }

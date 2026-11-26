@@ -79,12 +79,21 @@ export interface ReviewReport {
   frames: ReviewFrame[];
 }
 
-export type FilterMode = "all" | "diff" | "blunder";
+export type FilterMode = "all" | "diff" | "blunder" | "calls";
+
+export interface QuizStats {
+  answered: number;
+  matched: number;
+  ratingSum: number;
+}
 
 export interface AppState {
   report: ReviewReport | null;
   seat: number;
   filter: FilterMode;
-  xray: boolean;
+  revealSeats: [boolean, boolean, boolean, boolean];
+  quizMode: boolean;
+  quizAnsweredAction: number | null;
+  quizStats: QuizStats;
   cursor: number;
 }

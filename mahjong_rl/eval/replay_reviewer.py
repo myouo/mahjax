@@ -120,18 +120,33 @@ def format_action_cn(action: int, last_draw: int = -1, target: int = -1) -> str:
         return f"碰(赤) {format_tile_cn(target)}" if target >= 0 else "碰(赤)"
     if a == Action.OPEN_KAN:
         return f"大明杠 {format_tile_cn(target)}" if target >= 0 else "大明杠"
-    if a == Action.CHI_L:
-        return "吃(左)"
-    if a == Action.CHI_L_RED:
-        return "吃(左·赤)"
-    if a == Action.CHI_M:
-        return "吃(中)"
-    if a == Action.CHI_M_RED:
-        return "吃(中·赤)"
-    if a == Action.CHI_R:
-        return "吃(右)"
-    if a == Action.CHI_R_RED:
-        return "吃(右·赤)"
+    if a in (
+        Action.CHI_L,
+        Action.CHI_L_RED,
+        Action.CHI_M,
+        Action.CHI_M_RED,
+        Action.CHI_R,
+        Action.CHI_R_RED,
+    ):
+        is_red = a in (Action.CHI_L_RED, Action.CHI_M_RED, Action.CHI_R_RED)
+        if target >= 0:
+            t34 = 4 if target == 34 else (13 if target == 35 else (22 if target == 36 else target))
+            if 0 <= t34 < 27:
+                suit = "mps"[t34 // 9]
+                r = (t34 % 9) + 1
+                if a in (Action.CHI_L, Action.CHI_L_RED):
+                    p1, p2 = r + 1, r + 2
+                elif a in (Action.CHI_M, Action.CHI_M_RED):
+                    p1, p2 = r - 1, r + 1
+                else:
+                    p1, p2 = r - 2, r - 1
+                s1 = "0" if (is_red and p1 == 5) else str(p1)
+                s2 = "0" if (is_red and p2 == 5) else str(p2)
+                return f"吃 {format_tile_cn(target)}(配{s1}{s2}{suit})"
+        kind_str = "顺子左吃" if a in (Action.CHI_L, Action.CHI_L_RED) else (
+            "嵌张吃" if a in (Action.CHI_M, Action.CHI_M_RED) else "顺子右吃"
+        )
+        return f"{kind_str}(赤)" if is_red else kind_str
     if a == Action.PASS:
         return "PASS(跳过)"
     if a == Action.KYUUSHU:
@@ -467,7 +482,7 @@ def convert_tenhou_xml_to_mjai(xml_text: str) -> Tuple[List[Dict[str, Any]], Lis
     names = ["Seat 0", "Seat 1", "Seat 2", "Seat 3"]
     events: List[Dict[str, Any]] = [{"type": "start_game"}]
     winds = ("E", "S", "W", "N")
-    last_drawn = ["", "", "", ""]
+    last_drawn_tid = [-1, -1, -1, -1]
     last_discard_actor = 0
     in_kyoku = False
 
@@ -507,20 +522,22 @@ def convert_tenhou_xml_to_mjai(xml_text: str) -> Tuple[List[Dict[str, Any]], Lis
                     "tehais": tehais,
                 }
             )
-            last_drawn = ["", "", "", ""]
+            last_drawn_tid = [-1, -1, -1, -1]
         elif len(tag) >= 2 and tag[0] in draw_tags and tag[1:].isdigit():
             p = draw_tags[tag[0]]
-            pai = _tenhou_136_to_mjai(int(tag[1:]))
-            last_drawn[p] = pai
-            events.append({"type": "tsumo", "actor": p, "pai": pai})
+            tid = int(tag[1:])
+            last_drawn_tid[p] = tid
+            events.append({"type": "tsumo", "actor": p, "pai": _tenhou_136_to_mjai(tid)})
         elif len(tag) >= 2 and tag[0] in disc_tags and tag[1:].isdigit():
             p = disc_tags[tag[0]]
-            pai = _tenhou_136_to_mjai(int(tag[1:]))
-            tsumogiri = pai == last_drawn[p]
-            events.append({"type": "dahai", "actor": p, "pai": pai, "tsumogiri": tsumogiri})
+            tid = int(tag[1:])
+            tsumogiri = (tid == last_drawn_tid[p])
+            last_drawn_tid[p] = -1
+            events.append({"type": "dahai", "actor": p, "pai": _tenhou_136_to_mjai(tid), "tsumogiri": tsumogiri})
             last_discard_actor = p
         elif tag == "N":
             p = int(elem.attrib["who"])
+            last_drawn_tid[p] = -1
             kind, called, consumed = _decode_tenhou_xml_meld(int(elem.attrib["m"]))
             if kind == "ankan":
                 events.append({"type": "ankan", "actor": p, "consumed": consumed})

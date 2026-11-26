@@ -16,8 +16,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import os
+from pathlib import Path
+import pickle
 import time
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -122,6 +125,16 @@ def _clone_params(params: Any) -> Any:
     return jax.tree_util.tree_map(lambda x: jnp.array(x, copy=True), params)
 
 
+def _atomic_save_pickle(path: Path | str, payload: Any) -> Path:
+    dst = Path(path)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_suffix(dst.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(jax.device_get(payload), f)
+    os.replace(tmp, dst)
+    return dst
+
+
 def train_rl_v6(
     cfg: RLConfig,
     *,
@@ -133,11 +146,16 @@ def train_rl_v6(
     multi_gpu: bool = True,
     verbose: bool = True,
     log_every: int = 5,
+    resume_path: Optional[Path | str] = None,
+    checkpoint_path: Optional[Path | str] = None,
+    checkpoint_every: int = 50,
+    on_checkpoint: Optional[Callable[[int, Path], None]] = None,
 ) -> V6RLResult:
     """Run Phase 1 (Frozen-Policy Warmup) + Phase 2 (Sovereign-Mahjong V6 RL).
 
-    Automatically scales rollouts and gradient updates across ALL local GPUs via `jax.pmap`
-    when `multi_gpu=True` and `jax.local_device_count() > 1` (e.g., Kaggle T4x2).
+    Supports seamless multi-session continuous online self-play resume via
+    `resume_path` + periodic atomic `checkpoint_path` (preserving all 3 AdamW
+    optimizer states, PFSP pool, outer R-NaD snapshots, Running-RMS, and BC anchor).
     """
     n_devices = jax.local_device_count() if multi_gpu else 1
     use_pmap = (
@@ -169,7 +187,19 @@ def train_rl_v6(
         river_dim=cfg.belief.river_dim,
     )
 
-    rng = jax.random.PRNGKey(cfg.seed)
+    resume_state: Optional[Dict[str, Any]] = None
+    if resume_path is not None and Path(resume_path).exists():
+        with open(resume_path, "rb") as f:
+            resume_state = pickle.load(f)
+
+    start_update = 0
+    if resume_state is not None:
+        if "completed_updates" in resume_state:
+            start_update = int(resume_state["completed_updates"])
+        elif "history" in resume_state and resume_state["history"]:
+            start_update = int(resume_state["history"][-1].get("update", -1)) + 1
+
+    rng = jax.random.PRNGKey(cfg.seed + start_update)
     rng, k_pi, k_bel, k_grp, k_ora, k_pool, k_env = jax.random.split(rng, 7)
 
     params_pi = init_policy_params(policy_net, k_pi) if policy_params_init is None else _clone_params(policy_params_init)
@@ -193,6 +223,66 @@ def train_rl_v6(
     opt_belief = tx_belief.init(params_b_fast)
 
     rms_state: RunningRMSState = init_running_rms(1.0)
+    pfsp_pool: Deque[Any] = deque(maxlen=max(1, int(cfg.rnad.pfsp_pool_size)))
+    outer_snapshots: List[Any] = []
+    history: List[Dict[str, float]] = []
+    steps_since_outer_reset = int(cfg.rnad.reset_warmup_steps)
+    healer = SelfHealingManager(cfg=cfg.rnad)
+
+    if resume_state is not None:
+        if "params_pi" in resume_state:
+            params_pi = jax.device_put(resume_state["params_pi"])
+        elif "policy_params" in resume_state:
+            params_pi = jax.device_put(resume_state["policy_params"])
+        if "params_bc" in resume_state:
+            params_bc = jax.device_put(resume_state["params_bc"])
+        if "params_rho_base" in resume_state:
+            params_rho_base = jax.device_put(resume_state["params_rho_base"])
+        else:
+            params_rho_base = _clone_params(params_pi)
+        if "params_oracle" in resume_state:
+            params_oracle = jax.device_put(resume_state["params_oracle"])
+        elif "oracle_params" in resume_state:
+            params_oracle = jax.device_put(resume_state["oracle_params"])
+        if "params_b_fast" in resume_state:
+            params_b_fast = jax.device_put(resume_state["params_b_fast"])
+        elif "belief_ema_params" in resume_state:
+            params_b_fast = jax.device_put(resume_state["belief_ema_params"])
+        if "params_b_ema" in resume_state:
+            params_b_ema = jax.device_put(resume_state["params_b_ema"])
+        elif "belief_ema_params" in resume_state:
+            params_b_ema = jax.device_put(resume_state["belief_ema_params"])
+        if "opt_pi" in resume_state:
+            opt_pi = jax.device_put(resume_state["opt_pi"])
+        if "opt_oracle" in resume_state:
+            opt_oracle = jax.device_put(resume_state["opt_oracle"])
+        if "opt_belief" in resume_state:
+            opt_belief = jax.device_put(resume_state["opt_belief"])
+        if "rms_state" in resume_state:
+            rms_state = jax.device_put(resume_state["rms_state"])
+        if "pfsp_pool" in resume_state and resume_state["pfsp_pool"]:
+            for snap in resume_state["pfsp_pool"]:
+                pfsp_pool.append(jax.device_put(snap))
+        if "outer_snapshots" in resume_state and resume_state["outer_snapshots"]:
+            outer_snapshots = [jax.device_put(s) for s in resume_state["outer_snapshots"]]
+        if "history" in resume_state and resume_state["history"]:
+            history = list(resume_state["history"])
+        if "steps_since_outer_reset" in resume_state:
+            steps_since_outer_reset = int(resume_state["steps_since_outer_reset"])
+        if "healer_lr_scale" in resume_state:
+            healer.current_lr_scale = float(resume_state["healer_lr_scale"])
+        if verbose:
+            print(
+                f"[Phase 1/2 RL] Resumed from {resume_path} at update {start_update}/{cfg.num_updates} "
+                f"(lr_scale={healer.current_lr_scale:.3g}, pfsp={len(pfsp_pool)}, snaps={len(outer_snapshots)})",
+                flush=True,
+            )
+
+    if not pfsp_pool:
+        pfsp_pool.append(_clone_params(params_pi))
+    if not outer_snapshots:
+        outer_snapshots.append(_clone_params(params_pi))
+
     w_tables, is_pfsp_env, learning_seat_mask = sample_meta_table_pool(cfg.num_envs, k_pool)
 
     # Initialize parallel environments (sharded across all GPUs if `use_pmap`)
@@ -207,13 +297,7 @@ def train_rl_v6(
         w_tables_exec = w_tables
         learn_mask_exec = learning_seat_mask
 
-    # PFSP elite pool (single-snapshot per rollout -> zero recompile!) + SD-TAP snapshot buffer
-    pfsp_pool: Deque[Any] = deque(maxlen=max(1, int(cfg.rnad.pfsp_pool_size)))
-    pfsp_pool.append(_clone_params(params_pi))
-    outer_snapshots: List[Any] = [_clone_params(params_pi)]
-
-    healer = SelfHealingManager(cfg=cfg.rnad)
-    np_rng = np.random.default_rng(cfg.seed)
+    np_rng = np.random.default_rng(cfg.seed + start_update)
 
     # =========================================================================
     # JIT/PMAP 1: Vectorized Rollout (Per-Rollout Single-Snapshot PFSP, Zero Recompile!)
@@ -667,8 +751,6 @@ def train_rl_v6(
     n_total = cfg.num_envs * cfg.num_steps
     n_per_dev = envs_per_dev * cfg.num_steps
     mb_per_dev = min(cfg.minibatch_size // n_devices if use_pmap else cfg.minibatch_size, n_per_dev)
-    history: List[Dict[str, float]] = []
-    steps_since_outer_reset = cfg.rnad.reset_warmup_steps
     t_cal_arr = _rep(jnp.asarray(belief_t_cal, dtype=jnp.float32))
 
     # Replicate states across all GPUs if multi-GPU `pmap` is active
@@ -685,9 +767,37 @@ def train_rl_v6(
     params_rho_base = _rep(params_rho_base)
     rms_state = _rep(rms_state)
 
+    def _save_resume_ckpt(completed_upd: int) -> None:
+        if checkpoint_path is None:
+            return
+        payload = {
+            "completed_updates": int(completed_upd),
+            "params_pi": _unrep(params_pi),
+            "params_bc": _unrep(params_bc_exec),
+            "params_rho_base": _unrep(params_rho_base),
+            "params_oracle": _unrep(params_oracle),
+            "params_b_fast": _unrep(params_b_fast),
+            "params_b_ema": _unrep(params_b_ema),
+            "opt_pi": _unrep(opt_pi),
+            "opt_oracle": _unrep(opt_oracle),
+            "opt_belief": _unrep(opt_belief),
+            "rms_state": _unrep(rms_state),
+            "pfsp_pool": list(pfsp_pool),
+            "outer_snapshots": list(outer_snapshots),
+            "history": list(history),
+            "steps_since_outer_reset": int(steps_since_outer_reset),
+            "healer_lr_scale": float(healer.current_lr_scale),
+            "t_cal": float(belief_t_cal),
+        }
+        saved = _atomic_save_pickle(checkpoint_path, payload)
+        if verbose:
+            print(f"[Phase 1/2 RL] Saved resumable checkpoint at upd {completed_upd} -> {saved}", flush=True)
+        if on_checkpoint is not None:
+            on_checkpoint(completed_upd, saved)
+
     # Initial healthy checkpoint before updates (stored un-replicated on host)
     healer.save_checkpoint(
-        0,
+        start_update,
         {
             "params_pi": _unrep(params_pi),
             "opt_pi": _unrep(opt_pi),
@@ -700,17 +810,23 @@ def train_rl_v6(
         },
     )
 
-    if verbose:
+    if start_update >= cfg.num_updates:
+        if verbose:
+            print(
+                f"[Phase 1/2 RL] Already reached target updates ({start_update}/{cfg.num_updates}); skipping loop.",
+                flush=True,
+            )
+    elif verbose:
         print(
             f"[Phase 1/2 RL] devices={n_devices} ({'pmap' if use_pmap else 'jit'}) | "
             f"envs={cfg.num_envs} x T={cfg.num_steps} ({n_total:,} steps/upd) | "
-            f"updates={cfg.num_updates} (warmup={cfg.rnad.warmup_updates}) | "
-            f"Compiling rollout + update XLA graphs on update 1...",
+            f"updates={start_update}->{cfg.num_updates} (warmup={cfg.rnad.warmup_updates}) | "
+            f"Compiling rollout + update XLA graphs on first update...",
             flush=True,
         )
     t_rl_start = time.perf_counter()
 
-    for upd in range(cfg.num_updates):
+    for upd in range(start_update, cfg.num_updates):
         t_upd_start = time.perf_counter()
         in_warmup = upd < int(cfg.rnad.warmup_updates)
         phase2_step = max(0, upd - int(cfg.rnad.warmup_updates))
@@ -879,7 +995,7 @@ def train_rl_v6(
                 )
         history.append(summary)
         if verbose and (
-            upd == 0
+            upd == start_update
             or upd == int(cfg.rnad.warmup_updates)
             or (upd + 1) % max(int(log_every), 1) == 0
             or (upd + 1) == cfg.num_updates
@@ -887,7 +1003,8 @@ def train_rl_v6(
         ):
             phase_tag = "WARMUP" if in_warmup else "PHASE2"
             elapsed_rl = max(time.perf_counter() - t_rl_start, 1e-6)
-            eta_s = (elapsed_rl / (upd + 1)) * (cfg.num_updates - upd - 1)
+            done_this_run = max(upd - start_update + 1, 1)
+            eta_s = (elapsed_rl / done_this_run) * (cfg.num_updates - upd - 1)
             if health_action == "rollback_and_halve_lr":
                 heal_str = f" [SELF-HEALED! lr_scale={healer.current_lr_scale:.3g} | {heal_reasons_str}]"
             elif health_action == "abort":
@@ -903,12 +1020,20 @@ def train_rl_v6(
                 flush=True,
             )
 
+        if checkpoint_path is not None and checkpoint_every > 0 and ((upd + 1) % int(checkpoint_every) == 0):
+            _save_resume_ckpt(upd + 1)
+
+    if checkpoint_path is not None and start_update < cfg.num_updates:
+        if checkpoint_every <= 0 or (cfg.num_updates % int(checkpoint_every) != 0):
+            _save_resume_ckpt(cfg.num_updates)
+
     # Unreplicate final weights onto device 0 / host cleanly
     final_pi = jax.device_put(jax.device_get(_unrep(params_pi)), jax.local_devices()[0])
     final_b_ema = jax.device_put(jax.device_get(_unrep(params_b_ema)), jax.local_devices()[0])
     final_b_fast = jax.device_put(jax.device_get(_unrep(params_b_fast)), jax.local_devices()[0])
     final_ora = jax.device_put(jax.device_get(_unrep(params_oracle)), jax.local_devices()[0])
-    outer_snapshots.append(_clone_params(final_pi))
+    if start_update < cfg.num_updates:
+        outer_snapshots.append(_clone_params(final_pi))
 
     return V6RLResult(
         policy_model=policy_net,

@@ -34,3 +34,10 @@ tests/red_mahjong/test_replay.py
 /checkpoints/
 params
 offline_data
+
+# TypeScript Web Reviewer
+web/reviewer/node_modules/
+web/reviewer/dist/
+web/reviewer/public/sample_*.json
+review_*.html
+review_*.json

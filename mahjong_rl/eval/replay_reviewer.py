@@ -936,8 +936,8 @@ def review_replay(
             matched_ev = False
             chosen_action = int(Action.DUMMY)
             if cursor < n_ev:
-                tgt_actor = int(pr.event_actors[cursor])
-                tgt_action = int(pr.event_actions[cursor])
+                tgt_actor = int(pr.ev_actors[cursor])
+                tgt_action = int(pr.ev_actions[cursor])
                 if tgt_actor == cp and 0 <= tgt_action < Action.NUM_ACTION and mask_np[tgt_action]:
                     chosen_action = tgt_action
                     matched_ev = True

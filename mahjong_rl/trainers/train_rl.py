@@ -824,13 +824,33 @@ def train_rl_v6(
         for mk, vals in upd_metrics_acc.items():
             summary[mk] = float(np.mean(vals)) if vals else 0.0
 
+        # Save post-warmup healthy checkpoint so Phase 2 rollbacks never wipe out Warmup!
+        if enable_self_healing and in_warmup and (upd + 1 == int(cfg.rnad.warmup_updates)):
+            healer.save_checkpoint(
+                upd + 1,
+                {
+                    "params_pi": _unrep(params_pi),
+                    "opt_pi": _unrep(opt_pi),
+                    "params_oracle": _unrep(params_oracle),
+                    "opt_oracle": _unrep(opt_oracle),
+                    "params_b_fast": _unrep(params_b_fast),
+                    "opt_belief": _unrep(opt_belief),
+                    "params_b_ema": _unrep(params_b_ema),
+                    "rms_state": _unrep(rms_state),
+                },
+            )
+
         # Self-healing probe evaluation
+        heal_reasons_str = ""
+        health_action = "none"
         if enable_self_healing and (not in_warmup):
             report = healer.evaluate_probes(
                 summary,
                 finite_grads=all_finite,
                 distinct_deck_ratio=distinct_ratio,
             )
+            health_action = report.action_taken
+            heal_reasons_str = ", ".join(report.reasons)
             summary["healed"] = 1.0 if report.action_taken == "rollback_and_halve_lr" else 0.0
             if report.action_taken == "rollback_and_halve_lr":
                 restored = healer.restore_latest()
@@ -863,12 +883,17 @@ def train_rl_v6(
             or upd == int(cfg.rnad.warmup_updates)
             or (upd + 1) % max(int(log_every), 1) == 0
             or (upd + 1) == cfg.num_updates
-            or summary.get("healed", 0.0) > 0.5
+            or health_action != "none"
         ):
             phase_tag = "WARMUP" if in_warmup else "PHASE2"
             elapsed_rl = max(time.perf_counter() - t_rl_start, 1e-6)
             eta_s = (elapsed_rl / (upd + 1)) * (cfg.num_updates - upd - 1)
-            heal_str = " [SELF-HEALED!]" if summary.get("healed", 0.0) > 0.5 else ""
+            if health_action == "rollback_and_halve_lr":
+                heal_str = f" [SELF-HEALED! lr_scale={healer.current_lr_scale:.3g} | {heal_reasons_str}]"
+            elif health_action == "abort":
+                heal_str = f" [HEALTH-WARN(max_heals)! lr_scale={healer.current_lr_scale:.3g} | {heal_reasons_str}]"
+            else:
+                heal_str = ""
             print(
                 f"[RL {phase_tag}] upd {upd + 1}/{cfg.num_updates} ({upd_wall_s:.1f}s, {summary['sps']:,.0f} sps) | "
                 f"ora={summary.get('oracle_loss', 0.0):.3f} bel={summary.get('belief_loss', 0.0):.3f} "

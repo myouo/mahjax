@@ -465,10 +465,10 @@ def shard_for_pmap(tree: Any, n_devices: int) -> Any:
 
 
 def compute_birkhoff_error(probs_4x4: jnp.ndarray) -> jnp.ndarray:
-    """Max deviation of row sums and column sums from 1.0 across `(..., 4, 4)`."""
-    row_err = jnp.max(jnp.abs(jnp.sum(probs_4x4, axis=-1) - 1.0))
-    col_err = jnp.max(jnp.abs(jnp.sum(probs_4x4, axis=-2) - 1.0))
-    return jnp.maximum(row_err, col_err)
+    """Mean (across batch) of max row/column sum deviation from 1.0 over `(..., 4, 4)`."""
+    row_err = jnp.max(jnp.abs(jnp.sum(probs_4x4, axis=-1) - 1.0), axis=-1)
+    col_err = jnp.max(jnp.abs(jnp.sum(probs_4x4, axis=-2) - 1.0), axis=-1)
+    return jnp.mean(jnp.maximum(row_err, col_err))
 
 
 def compute_brier_4rank(probs_4x4: np.ndarray, true_rank_4x4: np.ndarray) -> float:

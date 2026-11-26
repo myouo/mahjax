@@ -10,6 +10,7 @@ weight-space mode collapse and with ZERO extra deployment latency!
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Sequence, Tuple
 
 import jax
@@ -47,6 +48,7 @@ def distill_sdtap(
     batch_size: int = 256,
     num_epochs: int = 2,
     seed: int = 0,
+    verbose: bool = True,
 ) -> Tuple[SovereignPolicyNet, Any, List[Dict[str, float]]]:
     """Distill the behavioral average of `snapshot_params_list` into a single `SovereignPolicyNet`."""
     if not snapshot_params_list:
@@ -142,8 +144,15 @@ def distill_sdtap(
         "table_init_wind",
         "table_wall_rem",
     )
+    if verbose:
+        print(
+            f"[Phase 3 SD-TAP] snapshots={len(snapshot_params_list)} | shards={len(shard_paths)} | "
+            f"bs={batch_size} | epochs={num_epochs}",
+            flush=True,
+        )
     history: List[Dict[str, float]] = []
     for epoch in range(num_epochs):
+        t_ep = time.perf_counter()
         loader = ShardBatchLoader(
             shard_paths,
             batch_size=batch_size,
@@ -153,11 +162,20 @@ def distill_sdtap(
             keys=req_keys,
             seed=seed + epoch,
         )
-        kls = []
+        kl_acc = jnp.array(0.0, dtype=jnp.float32)
+        n_steps = 0
         for batch_np in loader:
             batch = {k: jnp.asarray(batch_np[k]) for k in req_keys}
             params_deploy, opt_state, metrics = distill_step(params_deploy, opt_state, batch)
-            kls.append(float(metrics["sdtap_kl"]))
-        history.append({"epoch": float(epoch), "sdtap_kl": float(np.mean(kls)) if kls else 0.0})
+            kl_acc = kl_acc + metrics["sdtap_kl"]
+            n_steps += 1
+        mean_kl = float(jax.device_get(kl_acc)) / max(n_steps, 1)
+        history.append({"epoch": float(epoch), "sdtap_kl": mean_kl})
+        if verbose:
+            print(
+                f"[Phase 3 SD-TAP] ep {epoch + 1}/{num_epochs} ({n_steps} batches, {time.perf_counter() - t_ep:.1f}s) | "
+                f"sdtap_kl={mean_kl:.5f}",
+                flush=True,
+            )
 
     return model, params_deploy, history

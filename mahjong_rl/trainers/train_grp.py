@@ -8,6 +8,7 @@ After Phase 0-B, `GRP_base` is FROZEN as the DAG Fire-Wall for all input-side an
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Sequence, Tuple
 
 import jax
@@ -30,6 +31,7 @@ def train_grp(
     shard_paths: Sequence[Path | str],
     cfg: GRPConfig = GRPConfig(),
     seed: int = 0,
+    verbose: bool = True,
 ) -> Tuple[GRPNet, Any, List[Dict[str, float]]]:
     """Train `GRPNet` to predict Birkhoff `(4, 4)` final hanchan placement distributions."""
     model = GRPNet(config=cfg)
@@ -59,8 +61,15 @@ def train_grp(
         brier = jnp.mean(jnp.sum((probs - target_4x4) ** 2, axis=-1))
         return params, opt_state, loss, brier, birkhoff_err, probs
 
+    if verbose:
+        print(
+            f"[Phase 0-B GRP] shards={len(shard_paths)} | bs={cfg.batch_size} | epochs={cfg.num_epochs}",
+            flush=True,
+        )
+    t_all = time.perf_counter()
     history: List[Dict[str, float]] = []
     for epoch in range(cfg.num_epochs):
+        t_ep = time.perf_counter()
         loader = ShardBatchLoader(
             shard_paths,
             batch_size=cfg.batch_size,
@@ -93,14 +102,22 @@ def train_grp(
             else 0.0
         )
         denom = max(n_batches, 1)
-        history.append(
-            {
-                "epoch": float(epoch),
-                "grp_ce": float(loss_acc) / denom,
-                "grp_brier": float(brier_acc) / denom,
-                "grp_ece": float(ece),
-                "grp_birkhoff_err": float(max_b_err),
-            }
-        )
+        row = {
+            "epoch": float(epoch),
+            "grp_ce": float(loss_acc) / denom,
+            "grp_brier": float(brier_acc) / denom,
+            "grp_ece": float(ece),
+            "grp_birkhoff_err": float(max_b_err),
+        }
+        history.append(row)
+        if verbose:
+            ep_s = time.perf_counter() - t_ep
+            rem_s = ((time.perf_counter() - t_all) / (epoch + 1)) * (cfg.num_epochs - epoch - 1)
+            print(
+                f"[Phase 0-B GRP] ep {epoch + 1}/{cfg.num_epochs} ({n_batches} batches, {ep_s:.1f}s) | "
+                f"ce={row['grp_ce']:.4f} brier={row['grp_brier']:.4f} ece={row['grp_ece']:.4f} "
+                f"birkhoff={row['grp_birkhoff_err']:.2e} | ETA={rem_s/60:.1f}m",
+                flush=True,
+            )
 
     return model, params, history

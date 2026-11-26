@@ -9,6 +9,7 @@ bias init (`-4.184`) and 20% unbiased opponent utility dropout (`W_PHOENIX_7D, i
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Sequence, Tuple
 
 import jax
@@ -78,6 +79,8 @@ def train_belief(
     val_shard_paths: Sequence[Path | str] | None = None,
     suit_augment: bool = True,
     multi_gpu: bool = True,
+    verbose: bool = True,
+    log_interval_s: float = 20.0,
 ) -> Tuple[BeliefNet, Any, float, List[Dict[str, float]]]:
     """Train Phase 0-A `BeliefNet` (auto multi-GPU `pmap` if >1 GPU) and return `(model, params, T_cal, history)`."""
     model = BeliefNet(config=cfg)
@@ -166,8 +169,19 @@ def train_belief(
         "y_call_threat",
         "y_tenpai",
     )
+    if verbose:
+        print(
+            f"[Phase 0-A Belief] devices={n_devices} ({'pmap' if use_pmap else 'jit'}) | "
+            f"bs={cfg.batch_size} | shards={len(shard_paths)} | epochs={cfg.num_epochs} | "
+            f"Compiling XLA graph on first batch...",
+            flush=True,
+        )
     history: List[Dict[str, float]] = []
+    compiled_logged = False
+    t_all = time.perf_counter()
     for epoch in range(cfg.num_epochs):
+        t_ep = time.perf_counter()
+        t_last_log = t_ep
         loader = ShardBatchLoader(
             shard_paths,
             batch_size=cfg.batch_size,
@@ -196,18 +210,51 @@ def train_belief(
                 ep_acc = jax.tree_util.tree_map(lambda a, b: a + b, ep_acc, m_single)
             n_steps += 1
 
+            if verbose and not compiled_logged:
+                jax.block_until_ready(m_single)
+                print(
+                    f"[Phase 0-A Belief] XLA compiled in {time.perf_counter() - t_ep:.1f}s! Training...",
+                    flush=True,
+                )
+                compiled_logged = True
+                t_last_log = time.perf_counter()
+            elif verbose and (time.perf_counter() - t_last_log >= log_interval_s):
+                m_host = jax.device_get(m_single)
+                dt_ep = max(time.perf_counter() - t_ep, 1e-6)
+                sps = (n_steps * cfg.batch_size) / dt_ep
+                print(
+                    f"[Phase 0-A Belief] ep {epoch + 1}/{cfg.num_epochs} | step {n_steps} | "
+                    f"loss={float(m_host.get('belief_loss', 0.0)):.4f} "
+                    f"deal_bce={float(m_host.get('belief_deal_bce', 0.0)):.4f} | "
+                    f"{sps:,.0f} steps/s | elapsed={dt_ep:.0f}s",
+                    flush=True,
+                )
+                t_last_log = time.perf_counter()
+
         summary = {"epoch": float(epoch)}
         if ep_acc is not None and n_steps > 0:
             ep_host = jax.device_get(ep_acc)
             for mk, mv in ep_host.items():
                 summary[mk] = float(mv) / n_steps
         history.append(summary)
+        if verbose:
+            ep_s = time.perf_counter() - t_ep
+            rem_s = ((time.perf_counter() - t_all) / (epoch + 1)) * (cfg.num_epochs - epoch - 1)
+            print(
+                f"[Phase 0-A Belief] ep {epoch + 1}/{cfg.num_epochs} DONE ({n_steps} batches, {ep_s:.1f}s) | "
+                f"loss={summary.get('belief_loss', 0.0):.4f} "
+                f"deal_bce={summary.get('belief_deal_bce', 0.0):.4f} | "
+                f"ETA={rem_s/60:.1f}m",
+                flush=True,
+            )
 
     if use_pmap:
         params = jax.device_get(_unreplicate(params_rep))
         params = jax.device_put(params, jax.local_devices()[0])
 
     # Post-training Temperature Scaling calibration on held-out validation shards
+    if verbose:
+        print("[Phase 0-A Belief] Running held-out temperature calibration (T_cal)...", flush=True)
     cal_shards = val_shard_paths if val_shard_paths else shard_paths
     cal_keys = (
         "planes",

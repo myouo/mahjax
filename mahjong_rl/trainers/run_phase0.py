@@ -163,7 +163,10 @@ def evaluate_bc_val(
     grp_params,
     val_shards: Sequence[Path],
     batch_size: int = 512,
+    verbose: bool = True,
 ) -> Dict[str, float]:
+    if verbose:
+        print(f"[Phase 0-C BC] Evaluating {len(val_shards)} held-out validation shard(s)...", flush=True)
     req_keys = (
         "planes", "scalars", "river_tokens", "river_tile_ids", "river_valid_mask",
         "last_draw_type", "is_last_draw_red", "target_type", "target_is_red",

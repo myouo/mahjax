@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import queue
+import threading
 from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -11,7 +13,11 @@ from mahjong_rl.data.mjai_dataset import permute_v6_batch
 
 
 class ShardBatchLoader:
-    """Iterates over V6 `.npz` shards one at a time to keep host RAM bounded."""
+    """Iterates over V6 `.npz` shards one at a time to keep host RAM bounded.
+
+    When `prefetch > 0` (default `2`), runs `.npz` decompression, `float16 -> float32` upcast,
+    and 36x `suit_augment` in a lightweight background thread so GPU training never stalls on CPU I/O.
+    """
 
     def __init__(
         self,
@@ -22,6 +28,7 @@ class ShardBatchLoader:
         drop_last: bool = False,
         keys: Optional[Sequence[str]] = None,
         seed: int = 0,
+        prefetch: int = 2,
     ):
         self.shard_paths: List[Path] = [Path(p) for p in shard_paths]
         if not self.shard_paths:
@@ -31,9 +38,10 @@ class ShardBatchLoader:
         self.suit_augment = bool(suit_augment)
         self.drop_last = bool(drop_last)
         self.keys: Optional[Tuple[str, ...]] = tuple(keys) if keys is not None else None
+        self.prefetch = max(0, int(prefetch))
         self._rng = np.random.default_rng(seed)
 
-    def __iter__(self) -> Iterator[Dict[str, np.ndarray]]:
+    def _iter_sync(self) -> Iterator[Dict[str, np.ndarray]]:
         order = np.arange(len(self.shard_paths))
         if self.shuffle:
             self._rng.shuffle(order)
@@ -65,3 +73,53 @@ class ShardBatchLoader:
                     perm_idx = int(self._rng.integers(0, 36))
                     batch = permute_v6_batch(batch, perm_idx=perm_idx)
                 yield batch
+
+    def __iter__(self) -> Iterator[Dict[str, np.ndarray]]:
+        if self.prefetch <= 0:
+            yield from self._iter_sync()
+            return
+
+        q: "queue.Queue[Optional[Dict[str, np.ndarray]]]" = queue.Queue(maxsize=self.prefetch)
+        stop_evt = threading.Event()
+        err: List[BaseException] = []
+
+        def _worker() -> None:
+            try:
+                for batch in self._iter_sync():
+                    while not stop_evt.is_set():
+                        try:
+                            q.put(batch, timeout=0.2)
+                            break
+                        except queue.Full:
+                            continue
+                    if stop_evt.is_set():
+                        break
+            except BaseException as exc:
+                err.append(exc)
+            finally:
+                while True:
+                    try:
+                        q.put(None, timeout=0.2)
+                        break
+                    except queue.Full:
+                        if stop_evt.is_set():
+                            break
+
+        th = threading.Thread(target=_worker, daemon=True)
+        th.start()
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    break
+                yield item
+            if err:
+                raise err[0]
+        finally:
+            stop_evt.set()
+            # Drain at most one element to unblock producer if waiting on q.put
+            try:
+                q.get_nowait()
+            except queue.Empty:
+                pass
+            th.join(timeout=2.0)

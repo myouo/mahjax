@@ -131,6 +131,8 @@ def train_rl_v6(
     grp_params_init: Optional[Any] = None,
     enable_self_healing: bool = True,
     multi_gpu: bool = True,
+    verbose: bool = True,
+    log_every: int = 5,
 ) -> V6RLResult:
     """Run Phase 1 (Frozen-Policy Warmup) + Phase 2 (Sovereign-Mahjong V6 RL).
 
@@ -698,6 +700,16 @@ def train_rl_v6(
         },
     )
 
+    if verbose:
+        print(
+            f"[Phase 1/2 RL] devices={n_devices} ({'pmap' if use_pmap else 'jit'}) | "
+            f"envs={cfg.num_envs} x T={cfg.num_steps} ({n_total:,} steps/upd) | "
+            f"updates={cfg.num_updates} (warmup={cfg.rnad.warmup_updates}) | "
+            f"Compiling rollout + update XLA graphs on update 1...",
+            flush=True,
+        )
+    t_rl_start = time.perf_counter()
+
     for upd in range(cfg.num_updates):
         t_upd_start = time.perf_counter()
         in_warmup = upd < int(cfg.rnad.warmup_updates)
@@ -846,6 +858,25 @@ def train_rl_v6(
                     },
                 )
         history.append(summary)
+        if verbose and (
+            upd == 0
+            or upd == int(cfg.rnad.warmup_updates)
+            or (upd + 1) % max(int(log_every), 1) == 0
+            or (upd + 1) == cfg.num_updates
+            or summary.get("healed", 0.0) > 0.5
+        ):
+            phase_tag = "WARMUP" if in_warmup else "PHASE2"
+            elapsed_rl = max(time.perf_counter() - t_rl_start, 1e-6)
+            eta_s = (elapsed_rl / (upd + 1)) * (cfg.num_updates - upd - 1)
+            heal_str = " [SELF-HEALED!]" if summary.get("healed", 0.0) > 0.5 else ""
+            print(
+                f"[RL {phase_tag}] upd {upd + 1}/{cfg.num_updates} ({upd_wall_s:.1f}s, {summary['sps']:,.0f} sps) | "
+                f"ora={summary.get('oracle_loss', 0.0):.3f} bel={summary.get('belief_loss', 0.0):.3f} "
+                f"ent={summary.get('policy_entropy', 0.0):.3f} kl={summary.get('approx_kl', 0.0):.4f} "
+                f"beta_r={summary.get('beta_risk', 0.0):.3f} beta_o={summary.get('beta_offense', 0.0):.3f} | "
+                f"ETA={eta_s/60:.1f}m{heal_str}",
+                flush=True,
+            )
 
     # Unreplicate final weights onto device 0 / host cleanly
     final_pi = jax.device_put(jax.device_get(_unrep(params_pi)), jax.local_devices()[0])

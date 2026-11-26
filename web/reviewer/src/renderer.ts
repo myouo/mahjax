@@ -1,6 +1,6 @@
 import { calcDiscardUkeire, calcShanten, formatShantenCn, toTile34 } from "./shanten";
 import { renderTileImg, seatWindCn } from "./tiles";
-import type { AppState, MeldInfo, ReviewFrame, RiverTileTuple } from "./types";
+import type { ActionCandidate, AppState, MeldInfo, ReviewFrame, RiverTileTuple } from "./types";
 
 function escapeHtml(s: string): string {
   return s
@@ -16,9 +16,20 @@ export function getFilteredFrames(state: AppState): ReviewFrame[] {
     if (f.seat !== state.seat) return false;
     if (state.filter === "diff") return !f.matched_top1;
     if (state.filter === "blunder") return f.is_blunder;
-    if (state.filter === "calls") return !f.is_discard || f.best_action >= 72 || f.human_action >= 72;
+    if (state.filter === "calls") {
+      return !f.is_discard || f.best_action >= 72 || f.human_action >= 72 || hasSpecialCandidates(f);
+    }
     return true;
   });
+}
+
+function isSpecialAction(a: number): boolean {
+  // Self-kans (37..70) or Riichi/Tsumo/Ron/Pon/Chi/Pass/Kyuushu (72..85)
+  return (a >= 37 && a <= 70) || (a >= 72 && a <= 85);
+}
+
+function hasSpecialCandidates(f: ReviewFrame): boolean {
+  return (f.candidates ?? []).some((c) => isSpecialAction(c.a));
 }
 
 function buildVisibleCounts34(f: ReviewFrame): Int8Array {
@@ -54,16 +65,30 @@ function renderPond(riverList: RiverTileTuple[], posCls: string): string {
   return `<div class="pond ${posCls}">${tiles}</div>`;
 }
 
-function renderMeldsCorner(meldsList: MeldInfo[], posCls: string): string {
+/** Render open/closed melds with authentic closed-kan backs and sideways called tile. */
+function renderMeldsInline(meldsList: MeldInfo[], size: "xs" | "sm" = "xs"): string {
   if (!meldsList || meldsList.length === 0) return "";
-  return `<div class="melds-corner ${posCls}">${meldsList
-    .map(
-      (m) =>
-        `<div class="meld-grp">${m.tiles
-          .map((t) => renderTileImg(t, "xs"))
-          .join("")}</div>`
-    )
-    .join("")}</div>`;
+  const groups = meldsList
+    .map((m) => {
+      const tiles = m.tiles ?? [];
+      if (m.kind === "kan_closed" && tiles.length === 4) {
+        // Classic Tenhou/Majsoul closed kan: outer two face-down, inner two face-up
+        return `<div class="meld-grp" title="暗杠">
+          ${renderTileImg(-1, size)}
+          ${renderTileImg(tiles[1], size)}
+          ${renderTileImg(tiles[2], size)}
+          ${renderTileImg(-1, size)}
+        </div>`;
+      }
+      // For chi, leftmost tile (idx 0) is called; for pon/open_kan, last tile is called
+      const sideIdx = m.kind === "chi" ? 0 : tiles.length - 1;
+      const inner = tiles
+        .map((t, idx) => renderTileImg(t, size, idx === sideIdx ? "meld-side" : ""))
+        .join("");
+      return `<div class="meld-grp" title="${escapeHtml(m.kind)}">${inner}</div>`;
+    })
+    .join("");
+  return `<div class="melds-inline">${groups}</div>`;
 }
 
 function renderOppZone(
@@ -78,19 +103,24 @@ function renderOppZone(
   const revealed = state.revealSeats[absSeat];
   const tp = f.p_tenpai?.[relIdx] ?? 0;
   const hand = f.hands[absSeat] ?? [];
-  const showBelief = !state.quizMode || state.quizAnsweredAction !== null;
+  const melds = f.melds[absSeat] ?? [];
+  const showBelief = !state.quizMode || state.quizAnswers[f.idx] !== undefined;
 
   const tilesHtml = hand
     .map((t) => renderTileImg(revealed ? t : -1, "xs"))
     .join("");
+  const meldsHtml = renderMeldsInline(melds, "xs");
 
-  return `<div class="opp-zone ${posCls}" data-toggle-seat="${absSeat}" title="点击单独展开/隐藏 P${absSeat} 手牌">
-    <div class="opp-name-pill">
+  return `<div class="opp-zone ${posCls}">
+    <div class="opp-name-pill" data-toggle-seat="${absSeat}" title="点击单独展开/隐藏 P${absSeat} 手牌">
       <span>P${absSeat} ${name}</span>
       <span style="color:#94a3b8">${revealed ? "👁" : "🔒"}</span>
       ${showBelief && tp >= 0.35 ? `<span class="tenpai-chip">听 ${Math.round(tp * 100)}%</span>` : ""}
     </div>
-    <div class="opp-hand-strip">${tilesHtml}</div>
+    <div class="opp-row">
+      <div class="opp-hand-strip" data-toggle-seat="${absSeat}" title="点击单独展开/隐藏 P${absSeat} 手牌">${tilesHtml}</div>
+      ${meldsHtml}
+    </div>
   </div>`;
 }
 
@@ -103,14 +133,14 @@ function renderTenhouCenter(f: ReviewFrame): string {
   const edgeHtml = (absSeat: number, cls: string) => {
     const w = seatWindCn(absSeat, f.dealer);
     const isDealer = absSeat === f.dealer;
+    const isTurn = absSeat === f.seat;
     const stick = f.riichi[absSeat] ? `<div class="riichi-stick ${cls}"></div>` : "";
-    return `<div class="score-edge ${cls}">
+    return `<div class="score-edge ${cls}${isTurn ? " is-turn" : ""}">
       <span class="w-tag${isDealer ? " dealer" : ""}">${w}</span>
       <span class="pts">${f.scores[absSeat].toLocaleString()}</span>
     </div>${stick}`;
   };
 
-  // Authentic 5-slot dora indicator bar (unrevealed slots show back.svg)
   const doraSlots: number[] = [];
   for (let i = 0; i < 5; i++) {
     doraSlots.push(i < f.dora.length ? f.dora[i] : -1);
@@ -134,10 +164,88 @@ function renderTenhouCenter(f: ReviewFrame): string {
   </div>`;
 }
 
+function callButtonKindClass(a: number): string {
+  if (a === 72) return "kind-riichi";
+  if (a === 73 || a === 74) return "kind-win";
+  if (a === 84) return "kind-pass";
+  return "kind-call";
+}
+
+/** Authentic floating on-table Call / Riichi / Kan / Win / PASS dock WITH weights! */
+function renderTableActionDock(state: AppState, f: ReviewFrame): string {
+  const specialCands: ActionCandidate[] = (f.candidates ?? []).filter((c) => isSpecialAction(c.a));
+  if (specialCands.length === 0) return "";
+
+  const userAns = state.quizMode ? state.quizAnswers[f.idx] : undefined;
+  const hideAnswer = state.quizMode && userAns === undefined;
+
+  const targetHtml =
+    f.target >= 0
+      ? `<div class="target-tile-box"><span>鸣牌对象</span>${renderTileImg(f.target, "sm")}</div>`
+      : "";
+
+  const btnsHtml = specialCands
+    .map((c) => {
+      const kindCls = callButtonKindClass(c.a);
+      const isBest = c.a === f.best_action;
+      const isHuman = c.a === f.human_action;
+      const isUser = userAns !== undefined && userAns === c.a;
+
+      let hlCls = "";
+      let barCol = "#475569";
+      let tagHtml = "";
+
+      if (!hideAnswer) {
+        if (isUser && isBest) {
+          hlCls = "hl-both";
+          barCol = "#34d399";
+          tagHtml = `<span class="mini-tag ok">你✓AI</span>`;
+        } else if (isUser) {
+          hlCls = "hl-user";
+          barCol = "#c084fc";
+          tagHtml = `<span class="mini-tag usr">你选</span>`;
+        } else if (isBest && isHuman) {
+          hlCls = "hl-both";
+          barCol = "#34d399";
+          tagHtml = `<span class="mini-tag ok">一致✓</span>`;
+        } else if (isBest) {
+          hlCls = "hl-ai";
+          barCol = "#38bdf8";
+          tagHtml = `<span class="mini-tag ai">AI</span>`;
+        } else if (isHuman) {
+          hlCls = f.is_blunder ? "hl-blunder" : "hl-human";
+          barCol = f.is_blunder ? "#f87171" : "#fbbf24";
+          tagHtml = `<span class="mini-tag ${f.is_blunder ? "bad" : "hu"}">${f.is_blunder ? "恶手" : "实战"}</span>`;
+        }
+      }
+
+      const clickAttr = hideAnswer ? `data-quiz-action="${c.a}"` : "";
+      const clickCls = hideAnswer ? " clickable" : "";
+      const metaHtml = hideAnswer
+        ? `<div class="call-btn-meta" style="color:#94a3b8">点击作答</div>`
+        : `<div class="call-btn-meta">${tagHtml}<span>${(c.prob * 100).toFixed(1)}%</span></div>`;
+      const barHtml = hideAnswer
+        ? ""
+        : `<div class="call-btn-bar" style="width:${Math.max(3, c.prob * 100)}%;background:${barCol}"></div>`;
+
+      return `<button class="call-btn ${kindCls} ${hlCls}${clickCls}" ${clickAttr}>
+        <span>${escapeHtml(c.label)}</span>
+        ${metaHtml}
+        ${barHtml}
+      </button>`;
+    })
+    .join("");
+
+  return `<div class="table-action-dock">
+    ${targetHtml}
+    <div class="action-btn-group">${btnsHtml}</div>
+  </div>`;
+}
+
 function renderEgoDock(state: AppState, f: ReviewFrame): string {
   const absSeat = f.seat;
-  const hideAnswer = state.quizMode && state.quizAnsweredAction === null;
-  const userAns = state.quizMode ? state.quizAnsweredAction : null;
+  const userAns = state.quizMode ? state.quizAnswers[f.idx] : undefined;
+  const hideAnswer = state.quizMode && userAns === undefined;
 
   const probMap: Record<number, number> = {};
   for (const c of f.candidates ?? []) {
@@ -182,7 +290,7 @@ function renderEgoDock(state: AppState, f: ReviewFrame): string {
       const isHuman =
         f.human_action === sl.actionId || (sl.isDraw && f.human_action === 71);
       const isUser =
-        userAns !== null &&
+        userAns !== undefined &&
         (userAns === sl.actionId || (sl.isDraw && userAns === 71));
 
       let barCls = "other";
@@ -220,7 +328,7 @@ function renderEgoDock(state: AppState, f: ReviewFrame): string {
       }
 
       const hPx =
-        !hideAnswer && p > 0.004 ? Math.max(3, Math.round((p / maxP) * 38)) : 0;
+        !hideAnswer && p > 0.004 ? Math.max(3, Math.round((p / maxP) * 36)) : 0;
       const pctTxt = !hideAnswer
         ? p >= 0.01
           ? `${Math.round(p * 100)}%`
@@ -241,11 +349,9 @@ function renderEgoDock(state: AppState, f: ReviewFrame): string {
                   ? "#fbbf24"
                   : "#94a3b8";
 
-      const quizAttr =
-        hideAnswer && f.is_discard
-          ? `data-quiz-action="${sl.actionId}"`
-          : "";
-      const quizCls = hideAnswer && f.is_discard ? " quiz-clickable" : "";
+      const canClickTile = hideAnswer && f.is_discard;
+      const quizAttr = canClickTile ? `data-quiz-action="${sl.actionId}"` : "";
+      const quizCls = canClickTile ? " quiz-clickable" : "";
 
       return `<div class="hand-slot${sl.isDraw ? " draw-gap" : ""}${quizCls}" ${quizAttr}>
         <div class="naga-bar-box">
@@ -258,51 +364,45 @@ function renderEgoDock(state: AppState, f: ReviewFrame): string {
     })
     .join("");
 
-  // Action overlay: either Quiz prompt/buttons OR Call/Riichi summary banner
-  let overlayHtml = "";
-  const isSpecialStep = !f.is_discard || f.best_action >= 72 || f.human_action >= 72;
-  if (hideAnswer) {
-    if (isSpecialStep) {
-      const tgtHtml =
-        f.target >= 0 ? `<span>对象牌:</span>${renderTileImg(f.target, "sm")}` : "";
-      // Offer non-discard legal choices (or top legal choices) as clickable buttons
-      const specialBtns = (f.candidates ?? [])
-        .filter((c) => !f.is_discard || c.a >= 72)
-        .slice(0, 6)
-        .map(
-          (c) =>
-            `<button class="quiz-act-btn" data-quiz-action="${c.a}">${escapeHtml(c.label)}</button>`
-        )
-        .join("");
-      overlayHtml = `<div class="action-overlay">
-        <span>🎯 何切作答:</span>${tgtHtml}${specialBtns}
-        ${f.is_discard ? `<span style="color:#94a3b8">(或直接点击下方手牌切牌)</span>` : ""}
-      </div>`;
-    } else {
-      overlayHtml = `<div class="action-overlay" style="border-color:#a855f7;">
-        <span>🎯 <b>何切模式</b>：请直接点击下方手牌选择你的切牌（点击后揭晓 AI 权重与实战选择）</span>
-      </div>`;
-    }
-  } else if (isSpecialStep) {
-    const tgtHtml =
-      f.target >= 0 ? `<span>对象牌:</span>${renderTileImg(f.target, "sm")}` : "";
-    const huCol = f.matched_top1
-      ? "#34d399"
-      : f.is_blunder
-        ? "#f87171"
-        : "#fbbf24";
-    overlayHtml = `<div class="action-overlay">
-      ${tgtHtml}
-      <span>实战: <b style="color:${huCol}">${escapeHtml(f.human_action_str)} (${(f.human_prob * 100).toFixed(1)}%)</b></span>
-      <span>|</span>
-      <span>AI推荐: <b style="color:#38bdf8">${escapeHtml(f.best_action_str)} (${(f.best_prob * 100).toFixed(1)}%)</b></span>
-    </div>`;
-  }
+  const meldsHtml = renderMeldsInline(f.melds[absSeat] ?? [], "sm");
+  const quizHint =
+    hideAnswer && !hasSpecialCandidates(f)
+      ? `<div class="quiz-hint-pill">🎯 何切挑战：直接点击下方手牌作答（每题仅计分一次）</div>`
+      : "";
 
   return `<div class="ego-dock">
-    ${overlayHtml}
-    <div class="ego-hand-row">${slotsHtml}</div>
+    ${quizHint}
+    <div class="ego-strip">
+      <div class="ego-hand-row">${slotsHtml}</div>
+      ${meldsHtml}
+    </div>
   </div>`;
+}
+
+function computeQuizStats(state: AppState): { answered: number; matched: number; avgRating: number } {
+  const frames = state.report?.frames ?? [];
+  const byIdx = new Map<number, ReviewFrame>();
+  for (const fr of frames) byIdx.set(fr.idx, fr);
+
+  let answered = 0;
+  let matched = 0;
+  let ratingSum = 0;
+
+  for (const [idxStr, act] of Object.entries(state.quizAnswers)) {
+    const fr = byIdx.get(parseInt(idxStr, 10));
+    if (!fr) continue;
+    answered++;
+    if (act === fr.best_action) matched++;
+    const cand = (fr.candidates ?? []).find((c) => c.a === act);
+    const p = cand ? cand.prob : 0;
+    ratingSum += Math.min(1, p / Math.max(fr.best_prob, 1e-6)) * 100;
+  }
+
+  return {
+    answered,
+    matched,
+    avgRating: answered > 0 ? ratingSum / answered : 0,
+  };
 }
 
 export function renderApp(root: HTMLElement, state: AppState): void {
@@ -323,7 +423,8 @@ export function renderApp(root: HTMLElement, state: AppState): void {
   if (state.cursor >= frames.length) state.cursor = Math.max(0, frames.length - 1);
   const f = frames[state.cursor];
   const curSeatInfo = report.seats[String(state.seat)];
-  const hideAnswer = state.quizMode && state.quizAnsweredAction === null;
+  const userAns = f && state.quizMode ? state.quizAnswers[f.idx] : undefined;
+  const hideAnswer = state.quizMode && userAns === undefined;
 
   // Seat tabs
   const seatTabsHtml = Object.keys(report.seats)
@@ -333,12 +434,12 @@ export function renderApp(root: HTMLElement, state: AppState): void {
       return `<button class="seat-btn${active}" data-seat="${k}">
         <span>P${k} ${escapeHtml(s.name)}</span>
         <span class="rt">${s.rating.toFixed(1)}</span>
-        <span style="color:#94a3b8">${Math.round(s.overall_acc * 100)}%</span>
+        <span class="acc">${Math.round(s.overall_acc * 100)}%</span>
       </button>`;
     })
     .join("");
 
-  // Round quick-jump strip (with blunder indicator dot!)
+  // Round quick-jump strip
   const roundMap = new Map<number, { label: string; firstIdx: number; hasBlunder: boolean }>();
   frames.forEach((fr, idx) => {
     const existing = roundMap.get(fr.round_idx);
@@ -366,42 +467,38 @@ export function renderApp(root: HTMLElement, state: AppState): void {
     .filter((p) => p !== state.seat)
     .every((p) => state.revealSeats[p]);
 
-  // Compute Shanten + Ukeire for current frame
+  // Shanten & visible counts
   let shantenText = "";
   let visCounts: Int8Array | null = null;
   if (f) {
     const myMelds = (f.melds[f.seat] ?? []).length;
-    const sh = calcShanten(f.hands[f.seat] ?? [], myMelds);
-    shantenText = formatShantenCn(sh);
+    shantenText = formatShantenCn(calcShanten(f.hands[f.seat] ?? [], myMelds));
     visCounts = buildVisibleCounts34(f);
   }
 
-  // Board HTML
+  // Tenhou Square Board
   const boardHtml = f
     ? `<div class="tenhou-board">
         ${renderOppZone(state, f, (f.seat + 2) % 4, 1, "opp-top")}
         ${renderOppZone(state, f, (f.seat + 3) % 4, 2, "opp-left")}
         ${renderOppZone(state, f, (f.seat + 1) % 4, 0, "opp-right")}
-        ${renderMeldsCorner(f.melds[(f.seat + 2) % 4], "melds-top")}
-        ${renderMeldsCorner(f.melds[(f.seat + 3) % 4], "melds-left")}
-        ${renderMeldsCorner(f.melds[(f.seat + 1) % 4], "melds-right")}
-        ${renderMeldsCorner(f.melds[f.seat], "melds-bottom")}
         ${renderTenhouCenter(f)}
         ${renderPond(f.rivers[(f.seat + 2) % 4], "pond-top")}
         ${renderPond(f.rivers[(f.seat + 3) % 4], "pond-left")}
         ${renderPond(f.rivers[(f.seat + 1) % 4], "pond-right")}
         ${renderPond(f.rivers[f.seat], "pond-bottom")}
+        ${renderTableActionDock(state, f)}
         ${renderEgoDock(state, f)}
       </div>`
     : `<div class="tenhou-board" style="display:flex;align-items:center;justify-content:center;color:#94a3b8;">当前筛选条件下无匹配决策步</div>`;
 
-  // Quiz stats card
-  const qs = state.quizStats;
+  // Quiz card
+  const qs = computeQuizStats(state);
   const quizAcc = qs.answered > 0 ? `${((qs.matched / qs.answered) * 100).toFixed(1)}%` : "-";
-  const quizRt = qs.answered > 0 ? (qs.ratingSum / qs.answered).toFixed(1) : "-";
+  const quizRt = qs.answered > 0 ? qs.avgRating.toFixed(1) : "-";
   const quizCardHtml = state.quizMode
     ? `<div class="card quiz-card">
-        <h3><span>🎯 何切模式战绩</span><button class="btn" id="resetQuizBtn" style="padding:2px 7px;font-size:11px;">重置战绩</button></h3>
+        <h3><span>🎯 何切模式战绩（不可重复计分）</span><button class="btn" id="resetQuizBtn" style="padding:2px 8px;font-size:11px;">重置战绩</button></h3>
         <div class="stats-grid">
           <div class="stat-box"><div class="val purple">${qs.answered}</div><div class="lbl">已答题数</div></div>
           <div class="stat-box"><div class="val cyan">${quizAcc}</div><div class="lbl">AI一致率</div></div>
@@ -410,7 +507,7 @@ export function renderApp(root: HTMLElement, state: AppState): void {
       </div>`
     : "";
 
-  // Sidebar stats
+  // Player stats
   const statsHtml = curSeatInfo
     ? `<div class="stat-box"><div class="val cyan">${curSeatInfo.rating.toFixed(2)}</div><div class="lbl">Rating</div></div>
        <div class="stat-box"><div class="val">${(curSeatInfo.overall_acc * 100).toFixed(1)}%</div><div class="lbl">总一致率</div></div>
@@ -420,22 +517,31 @@ export function renderApp(root: HTMLElement, state: AppState): void {
        <div class="stat-box"><div class="val red">${curSeatInfo.blunder_count} (${(curSeatInfo.blunder_rate * 100).toFixed(1)}%)</div><div class="lbl">恶手</div></div>`
     : "";
 
-  // KillerDucky / Mortal Weight Table
+  // Weight Table & Belief
   let weightTableHtml = "";
   let verdictHtml = "";
   let tenpaiHtml = "";
   if (f) {
     if (hideAnswer) {
       verdictHtml = `<span class="mini-tag usr">等待作答</span>`;
-      weightTableHtml = `<div style="padding:18px 8px;text-align:center;color:#c084fc;font-size:13px;">
-        🔒 答案已隐藏 — 请在左侧雀桌点击你的选择<br/>
-        <span style="color:#94a3b8;font-size:12px;">当前手牌状态：<b>${shantenText}</b></span>
+      weightTableHtml = `<div style="padding:20px 10px;text-align:center;color:#c084fc;font-size:13px;line-height:1.7;">
+        🔒 答案已隐藏 — 请直接在左侧雀桌点击手牌或鸣牌/立直按钮作答<br/>
+        <span style="color:#94a3b8;font-size:12px;">当前手牌：<b>${shantenText}</b></span>
       </div>`;
-      tenpaiHtml = `<div style="font-size:12px;color:#94a3b8;padding:6px 0;">作答后显示 V6 Belief 对手听牌概率</div>`;
+      tenpaiHtml = `<div style="font-size:12px;color:#94a3b8;padding:6px 0;">作答后揭晓 V6 Belief 对手听牌概率</div>`;
     } else {
-      if (f.matched_top1) verdictHtml = `<span class="mini-tag ok">一致 ✓</span>`;
-      else if (f.is_blunder) verdictHtml = `<span class="mini-tag bad">恶手 (${(f.prob_ratio * 100).toFixed(0)}%)</span>`;
-      else verdictHtml = `<span class="mini-tag hu">分歧 (${(f.prob_ratio * 100).toFixed(0)}%)</span>`;
+      if (userAns !== undefined) {
+        const uMatch = userAns === f.best_action;
+        verdictHtml = uMatch
+          ? `<span class="mini-tag ok">已答 · 与AI一致 ✓</span>`
+          : `<span class="mini-tag usr">已锁定作答</span>`;
+      } else if (f.matched_top1) {
+        verdictHtml = `<span class="mini-tag ok">一致 ✓</span>`;
+      } else if (f.is_blunder) {
+        verdictHtml = `<span class="mini-tag bad">恶手 (${(f.prob_ratio * 100).toFixed(0)}%)</span>`;
+      } else {
+        verdictHtml = `<span class="mini-tag hu">分歧 (${(f.prob_ratio * 100).toFixed(0)}%)</span>`;
+      }
 
       const myMelds = (f.melds[f.seat] ?? []).length;
       const myHand = f.hands[f.seat] ?? [];
@@ -444,7 +550,7 @@ export function renderApp(root: HTMLElement, state: AppState): void {
         .map((c) => {
           const isAi = c.a === f.best_action;
           const isHu = c.a === f.human_action;
-          const isUsr = state.quizMode && state.quizAnsweredAction === c.a;
+          const isUsr = userAns !== undefined && userAns === c.a;
           let color = "#475569";
           let tags = "";
           if (isUsr) tags += `<span class="mini-tag usr">你</span>`;
@@ -463,7 +569,6 @@ export function renderApp(root: HTMLElement, state: AppState): void {
           }
           if (isUsr && !isAi && !isHu) color = "#a855f7";
 
-          // Compute live ukeire for discard candidates
           let ukeStr = "-";
           if (visCounts && (c.a <= 36 || c.a === 71)) {
             const dTile = c.a === 71 ? f.last_draw : c.a;
@@ -506,7 +611,7 @@ export function renderApp(root: HTMLElement, state: AppState): void {
     }
   }
 
-  // Key moves / blunder quick-jump list
+  // Key move quick-jump list
   const seatAllFrames = report.frames.filter((x) => x.seat === state.seat);
   const rankedBlunders = seatAllFrames
     .filter((x) => !x.matched_top1)
@@ -517,15 +622,15 @@ export function renderApp(root: HTMLElement, state: AppState): void {
     .map((x) => {
       const isCur = f && x.idx === f.idx ? " active" : "";
       const badCls = x.is_blunder ? " is-bad" : "";
+      const masked = state.quizMode && state.quizAnswers[x.idx] === undefined;
       return `<div class="blunder-item${badCls}${isCur}" data-jump-idx="${x.idx}">
         <span>${escapeHtml(x.round_label.replace(" 0本场", ""))} 第${x.turn}巡</span>
-        <span>${hideAnswer && isCur ? "???" : `${escapeHtml(x.human_action_str)} → <b style="color:#38bdf8">${escapeHtml(x.best_action_str)}</b>`}</span>
-        <span style="color:${x.is_blunder ? "#f87171" : "#fbbf24"}">${Math.round(x.human_prob * 100)}%</span>
+        <span>${masked ? "🔒 未作答" : `${escapeHtml(x.human_action_str)} → <b style="color:#38bdf8">${escapeHtml(x.best_action_str)}</b>`}</span>
+        <span style="color:${x.is_blunder ? "#f87171" : "#fbbf24"}">${masked ? "?" : `${Math.round(x.human_prob * 100)}%`}</span>
       </div>`;
     })
     .join("");
 
-  // Timeline
   const timelineHtml = frames
     .map((fr, i) => {
       const cls = fr.matched_top1 ? "ok" : fr.is_blunder ? "bad" : "diff";
@@ -580,7 +685,7 @@ export function renderApp(root: HTMLElement, state: AppState): void {
         </div>
 
         <div class="card">
-          <h3><span>V6 Belief 对手听牌概率</span><span style="font-size:11px;color:#94a3b8">点击对手手牌可单独开关</span></h3>
+          <h3><span>V6 Belief 对手听牌概率</span><span style="font-size:11px;color:#94a3b8">点对手手牌可单独开关</span></h3>
           ${tenpaiHtml}
         </div>
 

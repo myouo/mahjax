@@ -81,19 +81,13 @@ export interface ReviewReport {
 
 export type FilterMode = "all" | "diff" | "blunder" | "calls";
 
-export interface QuizStats {
-  answered: number;
-  matched: number;
-  ratingSum: number;
-}
-
 export interface AppState {
   report: ReviewReport | null;
   seat: number;
   filter: FilterMode;
   revealSeats: [boolean, boolean, boolean, boolean];
   quizMode: boolean;
-  quizAnsweredAction: number | null;
-  quizStats: QuizStats;
+  /** Map from frame.idx -> chosen actionId (each question can only be answered once) */
+  quizAnswers: Record<number, number>;
   cursor: number;
 }

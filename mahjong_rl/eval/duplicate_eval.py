@@ -4,11 +4,19 @@ Each wall seed is played 4 times with the candidate agent rotated across all 4 s
 (0, 1, 2, 3) against 3 copies of the baseline agent. Using `round_end="confirm"` (with
 DUMMY actions auto-played outside the policy) ensures every single hand of a full
 hanchan is captured accurately in hora / deal-in / riichi / meld telemetry.
+
+Performance notes (why this is fast on a GPU):
+- All `num_walls * 4` seat rotations of one chunk are flattened into a SINGLE batched
+  lane axis, so the policy/belief/GRP forwards see a real GPU-sized batch instead of
+  `4` lanes at a time.
+- The whole chunk runs inside one `jax.lax.while_loop` on device; it exits as soon as
+  every lane has terminated (instead of always stepping `max_steps`), and no per-step
+  value ever crosses back to the host.
 """
 
 from __future__ import annotations
 
-from typing import Callable, Dict
+from typing import Callable, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -21,11 +29,148 @@ from mahjong_rl.algo.sovereign_v6 import shard_for_pmap
 from mahjong_rl.config import EvalConfig
 
 
+def _expand_wall_batch(x: jnp.ndarray, num_players: int) -> jnp.ndarray:
+    """`(W, ...) -> (W * num_players, ...)`, repeating each wall once per seat rotation."""
+    return jnp.repeat(x[:, None], num_players, axis=1).reshape(
+        (x.shape[0] * num_players,) + x.shape[1:]
+    )
+
+
+def play_duplicate_chunk(
+    env,
+    candidate_actor: Callable[[mahjax.State, jax.Array], jnp.ndarray],
+    baseline_actor: Callable[[mahjax.State, jax.Array], jnp.ndarray],
+    rank_pts_arr: jnp.ndarray,
+    init_keys: jax.Array,
+    step_seeds: jax.Array,
+    max_steps: int,
+) -> Tuple[Dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Play one chunk of fixed-wall duplicate games with a single batched while-loop.
+
+    Args:
+        init_keys: `(W,)` per-wall deck keys.
+        step_seeds: `(W,)` per-wall action/step keys (shared by all 4 seat rotations).
+        max_steps: hard safety cap; the loop normally exits when all lanes terminate.
+
+    Returns:
+        totals:     `{key: (W, 4) int32/float32}`
+        rank_idx:   `(W, 4)` int32, 0 = 1st .. 3 = 4th
+        pt:         `(W, 4)` float32 Tenhou placement points
+        finished:   `(W, 4)` int32, 1 iff the lane terminated before `max_steps`
+    """
+    num_walls = init_keys.shape[0]
+    num_players = int(env.num_players)
+    lanes = num_walls * num_players
+
+    init_states = jax.vmap(env.init)(init_keys)  # (W, ...)
+    states = jax.tree_util.tree_map(lambda x: _expand_wall_batch(x, num_players), init_states)
+    agent_seats = jnp.tile(jnp.arange(num_players, dtype=jnp.int32), (num_walls,))
+    wall_seeds = jnp.repeat(step_seeds, num_players, axis=0)
+    rngs = wall_seeds
+
+    totals = {
+        "hands": jnp.zeros((lanes,), dtype=jnp.int32),
+        "won": jnp.zeros((lanes,), dtype=jnp.int32),
+        "dealt_in": jnp.zeros((lanes,), dtype=jnp.int32),
+        "riichi": jnp.zeros((lanes,), dtype=jnp.int32),
+        "melded": jnp.zeros((lanes,), dtype=jnp.int32),
+        "won_pts": jnp.zeros((lanes,), dtype=jnp.float32),
+        "dealt_in_pts": jnp.zeros((lanes,), dtype=jnp.float32),
+    }
+
+    def cond(carry):
+        states, _, step_idx, _ = carry
+        done = states.terminated | states.truncated
+        return jnp.any(~done) & (step_idx < int(max_steps))
+
+    def body(carry):
+        states, rngs, step_idx, totals = carry
+        done = states.terminated | states.truncated
+        step_keys = jax.vmap(lambda k: jax.random.split(k, 3))(rngs)  # (L, 3, 2)
+        rngs, k1, k2 = step_keys[:, 0], step_keys[:, 1], step_keys[:, 2]
+        # Deterministic kyoku-aligned wall key so all 4 duplicate rotations see identical
+        # deals on identical kyokus regardless of turn-count drift!
+        kyoku_id = states.round_state.round.astype(jnp.int32) * 64 + jnp.minimum(
+            states.round_state.honba.astype(jnp.int32), 63
+        )
+        k_step = jax.vmap(jax.random.fold_in)(wall_seeds, kyoku_id)
+
+        is_dummy = states.legal_action_mask[:, Action.DUMMY]
+        cp = states.current_player.astype(jnp.int32)
+        a_cand = jax.vmap(candidate_actor)(states, k1).astype(jnp.int32)
+        a_base = jax.vmap(baseline_actor)(states, k2).astype(jnp.int32)
+        policy_act = jnp.where(cp == agent_seats, a_cand, a_base)
+        action = jnp.where(is_dummy, jnp.int32(Action.DUMMY), policy_act).astype(jnp.int32)
+
+        raw_next = jax.vmap(env.step)(states, action, k_step)
+        # Freeze terminated lanes exactly like the per-lane `lax.cond` did.
+        next_states = jax.tree_util.tree_map(
+            lambda old, new: jnp.where(
+                done.reshape((-1,) + (1,) * (old.ndim - 1)), old, new
+            ),
+            states,
+            raw_next,
+        )
+
+        # Rising edge of terminated_round captures EVERY hand in confirm mode.
+        hand_ended = (
+            ~done
+            & next_states.round_state.terminated_round
+            & ~states.round_state.terminated_round
+        )
+        p = next_states.players
+        won = p.has_won
+        riichi = p.riichi
+        melded = ~p.is_hand_concealed
+        rewards = next_states.rewards.astype(jnp.float32)
+        is_hora = won.any(axis=-1)  # (L,)
+        is_ron = is_hora & ((rewards < 0.0).sum(axis=-1) == 1)  # (L,)
+        dealt_in_mask = is_ron[:, None] & (rewards < 0.0)  # (L, 4)
+
+        seat_idx = jnp.arange(lanes, dtype=jnp.int32)
+        cand_won = hand_ended & won[seat_idx, agent_seats]
+        cand_dealt_in = hand_ended & dealt_in_mask[seat_idx, agent_seats]
+        cand_riichi = hand_ended & riichi[seat_idx, agent_seats]
+        cand_melded = hand_ended & melded[seat_idx, agent_seats]
+        cand_rewards = rewards[seat_idx, agent_seats]
+
+        totals = {
+            "hands": totals["hands"] + hand_ended.astype(jnp.int32),
+            "won": totals["won"] + cand_won.astype(jnp.int32),
+            "dealt_in": totals["dealt_in"] + cand_dealt_in.astype(jnp.int32),
+            "riichi": totals["riichi"] + cand_riichi.astype(jnp.int32),
+            "melded": totals["melded"] + cand_melded.astype(jnp.int32),
+            "won_pts": totals["won_pts"] + jnp.where(cand_won, cand_rewards, 0.0),
+            "dealt_in_pts": totals["dealt_in_pts"] + jnp.where(cand_dealt_in, -cand_rewards, 0.0),
+        }
+        return next_states, rngs, step_idx + jnp.int32(1), totals
+
+    states, _, _, totals = lax.while_loop(
+        cond, body, (states, rngs, jnp.int32(0), totals)
+    )
+
+    scores = states.round_state.score.astype(jnp.float32)  # (L, 4)
+    init_wind = states.round_state.init_wind.astype(jnp.int32)  # (L, 4)
+    seat_idx = jnp.arange(lanes, dtype=jnp.int32)
+    my_score = scores[seat_idx, agent_seats]
+    my_wind = init_wind[seat_idx, agent_seats]
+    ahead = (scores > my_score[:, None]) | (
+        (scores == my_score[:, None]) & (init_wind < my_wind[:, None])
+    )
+    rank_idx = ahead.sum(axis=1).astype(jnp.int32)  # 0=1st .. 3=4th
+    pt = rank_pts_arr[rank_idx]
+    finished = (states.terminated | states.truncated).astype(jnp.int32)
+
+    shape = (num_walls, num_players)
+    totals = {k: v.reshape(shape) for k, v in totals.items()}
+    return totals, rank_idx.reshape(shape), pt.reshape(shape), finished.reshape(shape)
+
+
 def evaluate_duplicate_1v3(
     candidate_actor: Callable[[mahjax.State, jax.Array], jnp.ndarray],
     baseline_actor: Callable[[mahjax.State, jax.Array], jnp.ndarray],
     cfg: EvalConfig = EvalConfig(),
-    chunk_walls: int = 8,
+    chunk_walls: int = 16,
 ) -> Dict[str, float]:
     """Run paired fixed-wall Duplicate 1v3 evaluation (4 * cfg.num_walls total games).
 
@@ -33,6 +178,7 @@ def evaluate_duplicate_1v3(
         candidate_actor: `act(state, key) -> int32` scalar action for the candidate agent.
         baseline_actor: `act(state, key) -> int32` scalar action for the 3 baseline seats.
         cfg: EvalConfig specifying env_name, round_mode, num_walls, max_steps, rank_points.
+        chunk_walls: walls played concurrently per launch (`4 * chunk_walls` batched lanes).
 
     Returns:
         Dictionary of metrics including paired Tenhou pt mean & 95% CI, 1st-4th rank rates,
@@ -49,87 +195,20 @@ def evaluate_duplicate_1v3(
     # Use host NumPy constant so `jax.pmap` can replicate cleanly across all GPUs!
     rank_pts_arr = np.asarray(cfg.rank_points, dtype=np.float32)
 
-    def play_single_seat(init_state, agent_seat: jnp.ndarray, wall_step_seed: jax.Array):
-        def step_body(carry, step_idx):
-            state, rng = carry
-            done = state.terminated | state.truncated
-            rng, k1, k2 = jax.random.split(rng, 3)
-            # Derive deterministic kyoku-aligned wall key from (round, honba) so all 4 duplicate
-            # rotations see identical deals on identical kyokus regardless of turn-count drift!
-            kyoku_id = state.round_state.round.astype(jnp.int32) * 64 + jnp.minimum(
-                state.round_state.honba.astype(jnp.int32), 63
-            )
-            k_step = jax.random.fold_in(wall_step_seed, kyoku_id)
-
-            is_dummy = state.legal_action_mask[Action.DUMMY]
-            cp = state.current_player.astype(jnp.int32)
-            a_cand = candidate_actor(state, k1).astype(jnp.int32)
-            a_base = baseline_actor(state, k2).astype(jnp.int32)
-            policy_act = jnp.where(cp == agent_seat, a_cand, a_base)
-            action = jnp.where(is_dummy, jnp.int32(Action.DUMMY), policy_act)
-
-            next_state = lax.cond(
-                done,
-                lambda: state,
-                lambda: env.step(state, action, k_step),
-            )
-
-            # Rising edge of terminated_round captures EVERY hand in confirm mode
-            hand_ended = (
-                ~done
-                & next_state.round_state.terminated_round
-                & ~state.round_state.terminated_round
-            )
-            p = next_state.players
-            won = p.has_won
-            riichi = p.riichi
-            melded = ~p.is_hand_concealed
-            rewards = next_state.rewards.astype(jnp.float32)
-            is_hora = won.any()
-            is_ron = is_hora & ((rewards < 0.0).sum() == 1)
-            dealt_in_mask = is_ron & (rewards < 0.0)
-
-            cand_won = hand_ended & won[agent_seat]
-            cand_dealt_in = hand_ended & dealt_in_mask[agent_seat]
-            cand_riichi = hand_ended & riichi[agent_seat]
-            cand_melded = hand_ended & melded[agent_seat]
-
-            ev = {
-                "hands": hand_ended.astype(jnp.int32),
-                "won": cand_won.astype(jnp.int32),
-                "dealt_in": cand_dealt_in.astype(jnp.int32),
-                "riichi": cand_riichi.astype(jnp.int32),
-                "melded": cand_melded.astype(jnp.int32),
-                "won_pts": jnp.where(cand_won, rewards[agent_seat], 0.0),
-                "dealt_in_pts": jnp.where(cand_dealt_in, -rewards[agent_seat], 0.0),
-            }
-            return (next_state, rng), ev
-
-        (final_state, _), events = lax.scan(
-            step_body,
-            (init_state, wall_step_seed),
-            jnp.arange(cfg.max_steps, dtype=jnp.int32),
+    def run_chunk(init_keys, step_seeds):
+        return play_duplicate_chunk(
+            env,
+            candidate_actor,
+            baseline_actor,
+            jnp.asarray(rank_pts_arr),
+            init_keys,
+            step_seeds,
+            int(cfg.max_steps),
         )
-        totals = jax.tree.map(lambda x: x.sum(axis=0), events)
 
-        scores = final_state.round_state.score.astype(jnp.float32)
-        init_wind = final_state.round_state.init_wind.astype(jnp.int32)
-        my_score = scores[agent_seat]
-        my_wind = init_wind[agent_seat]
-        ahead = (scores > my_score) | ((scores == my_score) & (init_wind < my_wind))
-        rank_idx = ahead.sum().astype(jnp.int32)  # 0=1st .. 3=4th
-        pt = jnp.asarray(rank_pts_arr, dtype=jnp.float32)[rank_idx]
-        finished = (final_state.terminated | final_state.truncated).astype(jnp.int32)
-        return totals, rank_idx, pt, finished
-
-    def play_duplicate_wall(init_key: jax.Array, wall_step_seed: jax.Array):
-        init_state = env.init(init_key)
-        seats = jnp.arange(num_players, dtype=jnp.int32)
-        return jax.vmap(lambda s: play_single_seat(init_state, s, wall_step_seed))(seats)
-
-    run_single_dev = jax.jit(jax.vmap(play_duplicate_wall))
+    run_single_dev = jax.jit(run_chunk)
     n_devices = jax.local_device_count()
-    run_pmap = jax.pmap(jax.vmap(play_duplicate_wall)) if n_devices > 1 else None
+    run_pmap = jax.pmap(run_chunk) if n_devices > 1 else None
 
     rng = jax.random.PRNGKey(cfg.seed)
     k_init, k_step = jax.random.split(rng)
@@ -143,19 +222,31 @@ def evaluate_duplicate_1v3(
     for start in range(0, cfg.num_walls, step_w):
         end = min(start + step_w, cfg.num_walls)
         cnt = end - start
-        if run_pmap is not None and cnt >= n_devices and (cnt % n_devices == 0):
-            ik = shard_for_pmap(init_keys[start:end].reshape((n_devices, cnt // n_devices) + init_keys.shape[1:]), n_devices)
-            ss = shard_for_pmap(step_seeds[start:end].reshape((n_devices, cnt // n_devices) + step_seeds.shape[1:]), n_devices)
-            t_c, r_c, p_c, f_c = jax.device_get(run_pmap(ik, ss))
-            t_c = {k: np.asarray(v).reshape((cnt,) + np.asarray(v).shape[2:]) for k, v in t_c.items()}
-            r_c = np.asarray(r_c, dtype=np.int32).reshape((cnt, num_players))
-            p_c = np.asarray(p_c, dtype=np.float64).reshape((cnt, num_players))
-            f_c = np.asarray(f_c, dtype=np.float64).reshape((cnt, num_players))
+        ik = init_keys[start:end]
+        ss = step_seeds[start:end]
+        if cnt < step_w:
+            # Pad to a fixed shape so every launch reuses ONE compiled executable.
+            pad = step_w - cnt
+            ik = jnp.concatenate([ik, jnp.repeat(ik[-1:], pad, axis=0)], axis=0)
+            ss = jnp.concatenate([ss, jnp.repeat(ss[-1:], pad, axis=0)], axis=0)
+        if run_pmap is not None:
+            ik_sh = shard_for_pmap(
+                ik.reshape((n_devices, step_w // n_devices) + ik.shape[1:]), n_devices
+            )
+            ss_sh = shard_for_pmap(
+                ss.reshape((n_devices, step_w // n_devices) + ss.shape[1:]), n_devices
+            )
+            t_c, r_c, p_c, f_c = jax.device_get(run_pmap(ik_sh, ss_sh))
+            t_c = {k: np.asarray(v).reshape((step_w,) + np.asarray(v).shape[2:])[:cnt] for k, v in t_c.items()}
+            r_c = np.asarray(r_c, dtype=np.int32).reshape((step_w, num_players))[:cnt]
+            p_c = np.asarray(p_c, dtype=np.float64).reshape((step_w, num_players))[:cnt]
+            f_c = np.asarray(f_c, dtype=np.float64).reshape((step_w, num_players))[:cnt]
         else:
-            t_c, r_c, p_c, f_c = jax.device_get(run_single_dev(init_keys[start:end], step_seeds[start:end]))
-            r_c = np.asarray(r_c, dtype=np.int32)
-            p_c = np.asarray(p_c, dtype=np.float64)
-            f_c = np.asarray(f_c, dtype=np.float64)
+            t_c, r_c, p_c, f_c = jax.device_get(run_single_dev(ik, ss))
+            t_c = {k: np.asarray(v)[:cnt] for k, v in t_c.items()}
+            r_c = np.asarray(r_c, dtype=np.int32)[:cnt]
+            p_c = np.asarray(p_c, dtype=np.float64)[:cnt]
+            f_c = np.asarray(f_c, dtype=np.float64)[:cnt]
         totals_list.append(t_c)
         ranks_list.append(r_c)
         pts_list.append(p_c)

@@ -461,6 +461,7 @@ def train_rl_v6(
                 last_draw_type=obs["last_draw_type"],
                 is_last_draw_red=obs["is_last_draw_red"],
                 grp_fn=grp_base_fn,
+                curr_mat=grp_curr_4x4,
             )
 
             ora_out = oracle_net.apply(

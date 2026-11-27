@@ -203,7 +203,7 @@ class EvalConfig:
     env_name: Literal["red_4p", "no_red_4p"] = "red_4p"
     round_mode: Literal["single", "east", "half"] = "half"
     num_walls: int = 250              # Total games = 4 * num_walls
-    max_steps: int = 2400
+    max_steps: int = 2400             # Hard cap; the on-device while-loop exits as soon as all lanes finish
     rank_points: Tuple[float, float, float, float] = (90.0, 45.0, 0.0, -135.0)
     seed: int = 42
 

@@ -19,7 +19,7 @@ Implements all V6 physics & rule-exact primitives:
 
 from __future__ import annotations
 
-from typing import Callable, NamedTuple, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -407,30 +407,17 @@ def _resolve_head_bump_seat(discard_seat: jnp.ndarray, win_mask: jnp.ndarray) ->
     return cand_seats[first_idx]
 
 
-def simulate_ron_transition(
+def _ron_transition_targets(
     s_table: TableSnapshot,
     discard_seat: jnp.ndarray,
     win_mask_abs: jnp.ndarray,
     win_points_abs: jnp.ndarray,
-    grp_fn: Callable[[jnp.ndarray], jnp.ndarray],
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Bit-exact branchless MahJax Ron macro-transition (matches `mahjax/common/logic.py`).
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Branchless Ron macro-transition targets WITHOUT calling `grp_fn`.
 
-    Verified rules:
-    1. Multi-ron (`allow_double_ron=True`): each winner receives `win_points_abs[w]`, discarder
-       pays the sum of all winners' points; honba (`honba * 3`) and kyotaku (`kyotaku * 10`)
-       are paid ONLY ONCE to the head-bump winner (matching `logic.py` L1625-L1642!).
-    2. Riichi declaration deal-in: 1000-pt bet has NOT been deducted yet, so ZERO phantom rebate!
-    3. Dealer renchan: if dealer is among `win_mask_abs`, `round' = round, honba' = honba + 1`;
-       else `round' = round + 1, dealer' = (dealer + 1) % 4, honba' = 0`. Kyotaku resets to 0.
-    4. Exact `_is_game_end` (`logic.py` L1958-L1980): tobi (`any(score < 0)`), last sudden-death
-       round non-renchan, OR final round with deal passing / dealer-top agari-yame & `max >= 300`
-       -> outputs exact `(4, 4)` 1-hot permutation matrix; otherwise calls frozen `grp_fn`!
-
-    Returns:
-        rank_matrix_4x4: `(4, 4)` float32 (absolute seats x ranks 1..4)
-        new_scores:      `(4,)`   float32 (in 100-pt units)
-        is_terminal:     `()`     bool
+    Returns `(rank_matrix_4x4, next_grp_feat_29, is_terminal, new_scores_4)`.  Callers that
+    probe many hypothetical tables in one decision (`compute_analytical_trinity`) collect the
+    `next_grp_feat`s and run a single batched `jax.vmap(grp_fn)` instead of ~32 tiny forwards.
     """
     d_seat = discard_seat.astype(jnp.int32)
     w_mask = win_mask_abs.astype(jnp.bool_)
@@ -480,9 +467,69 @@ def simulate_ron_transition(
         init_wind=s_table.init_wind,
         wall_rem=jnp.int32(70),
     )
+    return rank_mat, next_grp_feat, is_terminal, new_scores
+
+
+def simulate_ron_transition(
+    s_table: TableSnapshot,
+    discard_seat: jnp.ndarray,
+    win_mask_abs: jnp.ndarray,
+    win_points_abs: jnp.ndarray,
+    grp_fn: Callable[[jnp.ndarray], jnp.ndarray],
+) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Bit-exact branchless MahJax Ron macro-transition (matches `mahjax/common/logic.py`).
+
+    Verified rules:
+    1. Multi-ron (`allow_double_ron=True`): each winner receives `win_points_abs[w]`, discarder
+       pays the sum of all winners' points; honba (`honba * 3`) and kyotaku (`kyotaku * 10`)
+       are paid ONLY ONCE to the head-bump winner (matching `logic.py` L1625-L1642!).
+    2. Riichi declaration deal-in: 1000-pt bet has NOT been deducted yet, so ZERO phantom rebate!
+    3. Dealer renchan: if dealer is among `win_mask_abs`, `round' = round, honba' = honba + 1`;
+       else `round' = round + 1, dealer' = (dealer + 1) % 4, honba' = 0`. Kyotaku resets to 0.
+    4. Exact `_is_game_end` (`logic.py` L1958-L1980): tobi (`any(score < 0)`), last sudden-death
+       round non-renchan, OR final round with deal passing / dealer-top agari-yame & `max >= 300`
+       -> returns the exact `(4, 4)` 1-hot permutation matrix; otherwise calls frozen `grp_fn`!
+
+    Returns:
+        rank_matrix_4x4: `(4, 4)` float32 (absolute seats x ranks 1..4)
+        new_scores:      `(4,)`   float32 (in 100-pt units)
+        is_terminal:     `()`     bool
+    """
+    rank_mat, next_grp_feat, is_terminal, new_scores = _ron_transition_targets(
+        s_table, discard_seat, win_mask_abs, win_points_abs
+    )
     grp_mat = grp_fn(next_grp_feat)  # (4, 4)
     out_mat = jnp.where(is_terminal, rank_mat, grp_mat)
     return out_mat, new_scores, is_terminal
+
+
+def _batched_grp_utility(
+    grp_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    feats: jnp.ndarray,
+    rank_mats: jnp.ndarray,
+    is_terms: jnp.ndarray,
+    c_p: jnp.ndarray,
+    w_me: jnp.ndarray,
+) -> jnp.ndarray:
+    """Evaluate every hypothetical table in ONE batched `jax.vmap(grp_fn)` call.
+
+    Args:
+        feats:     `(..., 29)` hypothetical `encode_grp_features_from_table` vectors.
+        rank_mats: `(..., 4, 4)` exact permutation matrices for terminal tables.
+        is_terms:  `(...)` bool, selects `rank_mats` over the GRP prediction.
+        c_p:       `()` int32 ego seat.
+        w_me:      `(4,)` normalized ego utility.
+
+    Returns:
+        `(...)` float32 ego utility `dot(selected_mat[c_p], w_me)` per hypothetical table.
+    """
+    lead = feats.shape[:-1]
+    flat_feats = feats.reshape((-1, feats.shape[-1]))
+    # `jax.vmap` (not a direct batched apply) keeps user-supplied 1-D-only `grp_fn`s valid.
+    mats = jax.vmap(grp_fn)(flat_feats).reshape(lead + (NUM_PLAYERS, NUM_PLAYERS))
+    mats = jnp.where(is_terms[..., None, None], rank_mats, mats)
+    u_by_seat = jnp.einsum("...ij,j->...i", mats, w_me)
+    return jnp.take(u_by_seat, c_p.astype(jnp.int32), axis=-1)
 
 
 def compute_analytical_trinity(
@@ -495,6 +542,7 @@ def compute_analytical_trinity(
     is_last_draw_red: jnp.ndarray,
     w_me: jnp.ndarray,
     grp_fn: Callable[[jnp.ndarray], jnp.ndarray],
+    curr_mat: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Compute the V6 Analytical Physics Trinity from frozen `GRP_base` (ZERO extra training cost!).
 
@@ -521,18 +569,20 @@ def compute_analytical_trinity(
     others = (c_p + jnp.arange(1, NUM_PLAYERS, dtype=jnp.int32)) % NUM_PLAYERS  # (3,)
     dealer = s_table.dealer.astype(jnp.int32)
 
-    # Current baseline expected utility from frozen GRP_base
-    curr_grp_feat = encode_grp_features_from_table(
-        scores=s_table.scores,
-        round_num=s_table.round_num,
-        round_limit=s_table.round_limit,
-        honba=s_table.honba,
-        kyotaku=s_table.kyotaku,
-        dealer=s_table.dealer,
-        init_wind=s_table.init_wind,
-        wall_rem=s_table.wall_rem,
-    )
-    curr_mat = grp_fn(curr_grp_feat)  # (4, 4)
+    # Current baseline expected utility from frozen GRP_base. Callers that already computed
+    # `GRP_base(current_state)` pass it in to avoid a redundant forward pass.
+    if curr_mat is None:
+        curr_grp_feat = encode_grp_features_from_table(
+            scores=s_table.scores,
+            round_num=s_table.round_num,
+            round_limit=s_table.round_limit,
+            honba=s_table.honba,
+            kyotaku=s_table.kyotaku,
+            dealer=s_table.dealer,
+            init_wind=s_table.init_wind,
+            wall_rem=s_table.wall_rem,
+        )
+        curr_mat = grp_fn(curr_grp_feat)  # (4, 4)
     u_curr = jnp.dot(curr_mat[c_p], w_me)  # scalar
 
     # =========================================================================
@@ -541,15 +591,17 @@ def compute_analytical_trinity(
     is_opp_dealer = others == dealer  # (3,)
     opp_score_grid = jnp.where(is_opp_dealer[:, None], SCORE_BINS_DEALER[None, :], SCORE_BINS_NON_DEALER[None, :])  # (3, 3)
 
-    def _sim_single_opp_bin(opp_abs: jnp.ndarray, pts_val: jnp.ndarray) -> jnp.ndarray:
+    def _single_ron_targets(opp_abs: jnp.ndarray, pts_val: jnp.ndarray):
         w_mask = jax.nn.one_hot(opp_abs, NUM_PLAYERS, dtype=jnp.bool_)
         w_pts = jnp.zeros((NUM_PLAYERS,), dtype=jnp.float32).at[opp_abs].set(pts_val)
-        mat, _, _ = simulate_ron_transition(s_table, c_p, w_mask, w_pts, grp_fn)
-        return jnp.dot(mat[c_p], w_me)
+        rank_mat, feat, is_term, _ = _ron_transition_targets(s_table, c_p, w_mask, w_pts)
+        return feat, rank_mat, is_term
 
-    u_post_grid = jax.vmap(
-        lambda o_abs, bins: jax.vmap(lambda pt: _sim_single_opp_bin(o_abs, pt))(bins)
-    )(others, opp_score_grid)  # (3, 3)
+    ron_feats, ron_ranks, ron_terms = jax.vmap(
+        lambda o_abs, bins: jax.vmap(lambda pt: _single_ron_targets(o_abs, pt))(bins)
+    )(others, opp_score_grid)  # (3, 3, 29), (3, 3, 4, 4), (3, 3)
+    # ONE batched GRP query for all 3 opponents x 3 score bins (was 9 separate forwards!)
+    u_post_grid = _batched_grp_utility(grp_fn, ron_feats, ron_ranks, ron_terms, c_p, w_me).reshape((3, 3))
     delta_u_grid = u_post_grid - u_curr  # (3, 3) — SIGNED (positive for Sashikomi, negative for deal-in!)
 
     # Unconditional expected shift GIVEN opponent o Rons tile a (3, 34)
@@ -564,19 +616,27 @@ def compute_analytical_trinity(
     # 2nd-order Double-Ron nonlinear cliff correction across the 3 opponent pairs (0,1), (0,2), (1,2)
     # Uses exact conditional expectation `U(double) - U(single_i) - U(single_j) + U_curr`!
     # Approximate pair score with each opponent's expected mangan/middle tier (`opp_score_grid[:, 1]`)
-    delta_u_2nd = jnp.zeros((NUM_TILES,), dtype=jnp.float32)
-    for i, j in ((0, 1), (0, 2), (1, 2)):
-        oi, oj = others[i], others[j]
+    pair_i = jnp.asarray((0, 0, 1), dtype=jnp.int32)
+    pair_j = jnp.asarray((1, 2, 2), dtype=jnp.int32)
+
+    def _double_ron_targets(pi, pj):
+        oi, oj = others[pi], others[pj]
         w_mask_ij = jax.nn.one_hot(oi, NUM_PLAYERS, dtype=jnp.bool_) | jax.nn.one_hot(oj, NUM_PLAYERS, dtype=jnp.bool_)
         w_pts_ij = (
             jnp.zeros((NUM_PLAYERS,), dtype=jnp.float32)
-            .at[oi].set(opp_score_grid[i, 1])
-            .at[oj].set(opp_score_grid[j, 1])
+            .at[oi].set(opp_score_grid[pi, 1])
+            .at[oj].set(opp_score_grid[pj, 1])
         )
-        mat_ij, _, _ = simulate_ron_transition(s_table, c_p, w_mask_ij, w_pts_ij, grp_fn)
-        u_ij = jnp.dot(mat_ij[c_p], w_me)
+        rank_mat, feat, is_term, _ = _ron_transition_targets(s_table, c_p, w_mask_ij, w_pts_ij)
+        return feat, rank_mat, is_term
+
+    dr_feats, dr_ranks, dr_terms = jax.vmap(_double_ron_targets)(pair_i, pair_j)  # (3, ...)
+    u_dr = _batched_grp_utility(grp_fn, dr_feats, dr_ranks, dr_terms, c_p, w_me)  # (3,)
+
+    delta_u_2nd = jnp.zeros((NUM_TILES,), dtype=jnp.float32)
+    for k, (i, j) in enumerate(((0, 1), (0, 2), (1, 2))):
         # Excess non-additive cliff: U(S - Si - Sj) - U(S - Si) - U(S - Sj) + U(S)
-        super_cliff = u_ij - u_post_grid[i, 1] - u_post_grid[j, 1] + u_curr
+        super_cliff = u_dr[k] - u_post_grid[i, 1] - u_post_grid[j, 1] + u_curr
         p_joint = p_deal_3opp[i] * p_deal_3opp[j]  # (34,)
         delta_u_2nd = delta_u_2nd + p_joint * super_cliff
 
@@ -605,7 +665,7 @@ def compute_analytical_trinity(
     self_is_dealer = c_p == dealer
     self_win_bins = jnp.where(self_is_dealer, SCORE_BINS_DEALER, SCORE_BINS_NON_DEALER)  # (3,)
 
-    def _sim_self_win(pts_val: jnp.ndarray) -> jnp.ndarray:
+    def _self_win_targets(pts_val: jnp.ndarray):
         # Average tsumo-like score transfer across the 3 opponents (exact total + kyotaku + honba)
         honba_v = s_table.honba.astype(jnp.float32) * float(HONBA_SCORE)
         kyotaku_v = s_table.kyotaku.astype(jnp.float32) * float(RIICHI_BET_SCORE)
@@ -627,15 +687,15 @@ def compute_analytical_trinity(
         new_d = jnp.where(self_is_dealer, dealer, (dealer + 1) % NUM_PLAYERS)
         new_h = jnp.where(self_is_dealer, s_table.honba.astype(jnp.int32) + 1, 0)
         gf = encode_grp_features_from_table(new_sc, new_r, r_lim, new_h, jnp.int32(0), new_d, s_table.init_wind, jnp.int32(70))
-        mat = jnp.where(is_term, rank_mat, grp_fn(gf))
-        return jnp.dot(mat[c_p], w_me) - u_curr
+        return gf, rank_mat, is_term
 
-    delta_u_agari_3 = jax.vmap(_sim_self_win)(self_win_bins)  # (3,)
+    sw_feats, sw_ranks, sw_terms = jax.vmap(_self_win_targets)(self_win_bins)  # (3, ...)
+    delta_u_agari_3 = _batched_grp_utility(grp_fn, sw_feats, sw_ranks, sw_terms, c_p, w_me) - u_curr  # (3,)
 
     # =========================================================================
     # 3. ENDGAME: Delta_U_ryuukyoku (Keishiki Tenpai swing when wall_rem <= 12)
     # =========================================================================
-    def _eval_draw_for_cfg(opp_ten_3: jnp.ndarray, self_tenpai: jnp.ndarray) -> jnp.ndarray:
+    def _draw_targets(opp_ten_3: jnp.ndarray, self_tenpai: jnp.ndarray):
         # Build 4-seat tenpai mask in absolute seat order
         ten_abs = jnp.zeros((NUM_PLAYERS,), dtype=jnp.float32).at[c_p].set(self_tenpai).at[others].set(opp_ten_3)
         n_ten = jnp.sum(ten_abs)
@@ -659,8 +719,7 @@ def compute_analytical_trinity(
         new_d = jnp.where(dealer_ten, dealer, (dealer + 1) % NUM_PLAYERS)
         new_h = s_table.honba.astype(jnp.int32) + 1  # Draw always increments honba!
         gf = encode_grp_features_from_table(new_sc, new_r, r_lim, new_h, s_table.kyotaku, new_d, s_table.init_wind, jnp.int32(70))
-        mat = jnp.where(is_term, rank_mat, grp_fn(gf))
-        return jnp.dot(mat[c_p], w_me)
+        return gf, rank_mat, is_term
 
     # Weight all 8 opponent tenpai configurations by B_EMA's `p_tenpai_3`!
     p_t = jnp.clip(p_tenpai_3, 0.0, 1.0)
@@ -668,8 +727,15 @@ def compute_analytical_trinity(
         jnp.where(_TENPAI_CONFIGS > 0.5, p_t[None, :], 1.0 - p_t[None, :]),
         axis=-1,
     )  # (8,)
-    u_if_ten = jnp.sum(cfg_probs * jax.vmap(lambda c: _eval_draw_for_cfg(c, jnp.float32(1.0)))(_TENPAI_CONFIGS))
-    u_if_noten = jnp.sum(cfg_probs * jax.vmap(lambda c: _eval_draw_for_cfg(c, jnp.float32(0.0)))(_TENPAI_CONFIGS))
+    # One batched GRP query for all 8 tenpai configs x {self tenpai, self noten} (was 16 forwards!)
+    draw_feats, draw_ranks, draw_terms = jax.vmap(
+        lambda cfg: jax.vmap(lambda st: _draw_targets(cfg, st))(
+            jnp.asarray((1.0, 0.0), dtype=jnp.float32)
+        )
+    )(_TENPAI_CONFIGS)  # (8, 2, ...)
+    u_draw = _batched_grp_utility(grp_fn, draw_feats, draw_ranks, draw_terms, c_p, w_me)  # (8, 2)
+    u_if_ten = jnp.sum(cfg_probs * u_draw[:, 0])
+    u_if_noten = jnp.sum(cfg_probs * u_draw[:, 1])
     in_endgame = (s_table.wall_rem <= 12).astype(jnp.float32)
     delta_u_ryuukyoku = in_endgame * (u_if_ten - u_if_noten)
 

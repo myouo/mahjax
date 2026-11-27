@@ -14,21 +14,19 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
 import json
 import os
-from pathlib import Path
 import pickle
 import time
+from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax import lax
 
 import mahjax
-from mahjax.common.action import Action
 from mahjong_rl.algo.utility import W_PHOENIX_7D
 from mahjong_rl.config import (
     BeliefConfig,
@@ -39,7 +37,9 @@ from mahjong_rl.config import (
     RLConfig,
     RNaDConfig,
 )
+from mahjong_rl.eval.duplicate_eval import play_duplicate_chunk
 from mahjong_rl.eval.mjai_bridge import make_v6_policy_actor
+from mahjong_rl.jax_runtime import enable_persistent_compilation_cache
 from mahjong_rl.models.belief import BeliefNet
 from mahjong_rl.models.grp import GRPNet
 from mahjong_rl.trainers.train_rl import train_rl_v6
@@ -66,7 +66,7 @@ class _CompiledDuplicateVsBCEvaluator:
         grp_params: Any,
         belief_t_cal: float,
         eval_cfg: EvalConfig,
-        chunk_walls: int = 4,
+        chunk_walls: int = 16,
     ) -> None:
         self.policy_model = policy_model
         self.belief_model = belief_model
@@ -83,7 +83,7 @@ class _CompiledDuplicateVsBCEvaluator:
             round_end="confirm",
         )
         self.num_players = self.env.num_players
-        rank_pts_arr = np.asarray(eval_cfg.rank_points, dtype=np.float32)
+        rank_pts_arr = jnp.asarray(eval_cfg.rank_points, dtype=np.float32)
 
         def eval_chunk(cand_pol, cand_bel, base_pol, base_bel, init_keys, step_seeds):
             cand_actor = make_v6_policy_actor(
@@ -110,81 +110,16 @@ class _CompiledDuplicateVsBCEvaluator:
                 belief_t_cal=self.belief_t_cal,
                 greedy=True,
             )
-
-            def play_single_seat(init_state, agent_seat: jnp.ndarray, wall_step_seed: jax.Array):
-                def step_body(carry, step_idx):
-                    state, rng = carry
-                    done = state.terminated | state.truncated
-                    rng, k1, k2 = jax.random.split(rng, 3)
-                    kyoku_id = state.round_state.round.astype(jnp.int32) * 64 + jnp.minimum(
-                        state.round_state.honba.astype(jnp.int32), 63
-                    )
-                    k_step = jax.random.fold_in(wall_step_seed, kyoku_id)
-
-                    is_dummy = state.legal_action_mask[Action.DUMMY]
-                    cp = state.current_player.astype(jnp.int32)
-                    a_cand = cand_actor(state, k1).astype(jnp.int32)
-                    a_base = base_actor(state, k2).astype(jnp.int32)
-                    policy_act = jnp.where(cp == agent_seat, a_cand, a_base)
-                    action = jnp.where(is_dummy, jnp.int32(Action.DUMMY), policy_act)
-
-                    next_state = lax.cond(
-                        done,
-                        lambda: state,
-                        lambda: self.env.step(state, action, k_step),
-                    )
-                    hand_ended = (
-                        ~done
-                        & next_state.round_state.terminated_round
-                        & ~state.round_state.terminated_round
-                    )
-                    p = next_state.players
-                    won = p.has_won
-                    riichi = p.riichi
-                    melded = ~p.is_hand_concealed
-                    rewards = next_state.rewards.astype(jnp.float32)
-                    is_hora = won.any()
-                    is_ron = is_hora & ((rewards < 0.0).sum() == 1)
-                    dealt_in_mask = is_ron & (rewards < 0.0)
-
-                    cand_won = hand_ended & won[agent_seat]
-                    cand_dealt_in = hand_ended & dealt_in_mask[agent_seat]
-                    cand_riichi = hand_ended & riichi[agent_seat]
-                    cand_melded = hand_ended & melded[agent_seat]
-
-                    ev = {
-                        "hands": hand_ended.astype(jnp.int32),
-                        "won": cand_won.astype(jnp.int32),
-                        "dealt_in": cand_dealt_in.astype(jnp.int32),
-                        "riichi": cand_riichi.astype(jnp.int32),
-                        "melded": cand_melded.astype(jnp.int32),
-                        "won_pts": jnp.where(cand_won, rewards[agent_seat], 0.0),
-                        "dealt_in_pts": jnp.where(cand_dealt_in, -rewards[agent_seat], 0.0),
-                    }
-                    return (next_state, rng), ev
-
-                (final_state, _), events = lax.scan(
-                    step_body,
-                    (init_state, wall_step_seed),
-                    jnp.arange(eval_cfg.max_steps, dtype=jnp.int32),
-                )
-                totals = jax.tree.map(lambda x: x.sum(axis=0), events)
-                scores = final_state.round_state.score.astype(jnp.float32)
-                init_wind = final_state.round_state.init_wind.astype(jnp.int32)
-                my_score = scores[agent_seat]
-                my_wind = init_wind[agent_seat]
-                ahead = (scores > my_score) | ((scores == my_score) & (init_wind < my_wind))
-                rank_idx = ahead.sum().astype(jnp.int32)
-                pt = jnp.asarray(rank_pts_arr, dtype=jnp.float32)[rank_idx]
-                finished = (final_state.terminated | final_state.truncated).astype(jnp.int32)
-                return totals, rank_idx, pt, finished
-
-            def play_wall(init_key: jax.Array, wall_step_seed: jax.Array):
-                st0 = self.env.init(init_key)
-                seats = jnp.arange(self.num_players, dtype=jnp.int32)
-                return jax.vmap(lambda s: play_single_seat(st0, s, wall_step_seed))(seats)
-
-            return jax.vmap(play_wall)(init_keys, step_seeds)
+            # One flat batched while-loop over (walls x 4 seat rotations) with early exit.
+            return play_duplicate_chunk(
+                self.env,
+                cand_actor,
+                base_actor,
+                rank_pts_arr,
+                init_keys,
+                step_seeds,
+                int(eval_cfg.max_steps),
+            )
 
         self._run_jit = jax.jit(eval_chunk)
         rng = jax.random.PRNGKey(eval_cfg.seed)
@@ -256,11 +191,22 @@ class _CompiledDuplicateVsBCEvaluator:
 
 
 def main(argv: Optional[List[str]] = None) -> None:
+    enable_persistent_compilation_cache()
     parser = argparse.ArgumentParser(description="Clean Sovereign-Mahjong V6 RL trainer from Phase 0 checkpoints.")
     parser.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints/sovereign_v6"))
     parser.add_argument("--out-dir", type=Path, default=None, help="Output directory (defaults to --ckpt-dir)")
-    parser.add_argument("--num-envs", type=int, default=32)
-    parser.add_argument("--num-steps", type=int, default=256)
+    parser.add_argument(
+        "--num-envs",
+        type=int,
+        default=32,
+        help="Parallel games per rollout (GPU batch). Raise until VRAM is the limit.",
+    )
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        default=256,
+        help="Rollout horizon per env; transitions/update = num_envs * num_steps.",
+    )
     parser.add_argument("--num-updates", type=int, default=500)
     parser.add_argument("--warmup-updates", type=int, default=80)
     parser.add_argument("--outer-reset-steps", type=int, default=0)
@@ -283,7 +229,12 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=100)
     parser.add_argument("--eval-walls", type=int, default=16)
-    parser.add_argument("--eval-chunk-walls", type=int, default=4)
+    parser.add_argument(
+        "--eval-chunk-walls",
+        type=int,
+        default=16,
+        help="Walls evaluated concurrently; 4*this batched lanes. Lower it if VRAM OOMs.",
+    )
     parser.add_argument("--eval-seed", type=int, default=2026)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-every", type=int, default=5)

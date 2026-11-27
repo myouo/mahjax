@@ -38,6 +38,7 @@ from mahjong_rl.config import BCConfig, BeliefConfig, EvalConfig, GRPConfig, Mod
 from mahjong_rl.data.shard_loader import ShardBatchLoader
 from mahjong_rl.eval.duplicate_eval import evaluate_duplicate_1v3
 from mahjong_rl.eval.mjai_bridge import make_v6_policy_actor
+from mahjong_rl.jax_runtime import enable_persistent_compilation_cache
 from mahjong_rl.trainers.train_bc import _compute_batch_trinity, train_bc
 from mahjong_rl.trainers.train_belief import _extract_w_opp_5d, train_belief
 from mahjong_rl.trainers.train_grp import train_grp
@@ -237,6 +238,7 @@ def evaluate_bc_val(
 
 
 def main() -> None:
+    enable_persistent_compilation_cache()
     parser = argparse.ArgumentParser(description="Sovereign-Mahjong V6 Phase 0 Training & Evaluation Runner")
     parser.add_argument("--shard-dir", type=Path, default=Path("data/v6_shards_2026"))
     parser.add_argument("--out-dir", type=Path, default=Path("checkpoints/v6_phase0_run1"))

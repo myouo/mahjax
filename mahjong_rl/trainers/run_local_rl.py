@@ -260,17 +260,25 @@ def main(argv: Optional[List[str]] = None) -> None:
     parser.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints/sovereign_v6"))
     parser.add_argument("--out-dir", type=Path, default=None, help="Output directory (defaults to --ckpt-dir)")
     parser.add_argument("--num-envs", type=int, default=32)
-    parser.add_argument("--num-steps", type=int, default=128)
+    parser.add_argument("--num-steps", type=int, default=256)
     parser.add_argument("--num-updates", type=int, default=500)
-    parser.add_argument("--warmup-updates", type=int, default=100)
-    parser.add_argument("--outer-reset-steps", type=int, default=400)
+    parser.add_argument("--warmup-updates", type=int, default=80)
+    parser.add_argument("--outer-reset-steps", type=int, default=0)
+    parser.add_argument("--pfsp-snapshot-interval", type=int, default=200)
     parser.add_argument("--update-epochs", type=int, default=2)
     parser.add_argument("--minibatch-size", type=int, default=512)
-    parser.add_argument("--policy-lr", type=float, default=4e-5)
-    parser.add_argument("--alpha-rnad", type=float, default=0.08)
+    parser.add_argument("--policy-lr", type=float, default=3e-5)
+    parser.add_argument("--alpha-rnad", type=float, default=0.12)
     parser.add_argument("--rho-mix-bc", type=float, default=0.10)
-    parser.add_argument("--rho-mix-uniform", type=float, default=0.003)
+    parser.add_argument("--rho-mix-uniform", type=float, default=0.005)
+    parser.add_argument("--entropy-coef", type=float, default=0.002)
     parser.add_argument("--lambda-intra", type=float, default=1.0)
+    parser.add_argument("--lambda-inter", type=float, default=0.0)
+    parser.add_argument("--mask-unterminated-tail", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--phoenix-7d-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--pfsp-frac", type=float, default=0.625)
+    parser.add_argument("--opp-temperature", type=float, default=0.35)
+    parser.add_argument("--oracle-replay-updates", type=int, default=6)
     parser.add_argument("--freeze-belief", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--checkpoint-every", type=int, default=50)
     parser.add_argument("--eval-every", type=int, default=100)
@@ -323,15 +331,22 @@ def main(argv: Optional[List[str]] = None) -> None:
         model=model_cfg,
         belief=bel_cfg,
         grp=grp_cfg,
-        oracle=OracleConfig(),
+        oracle=OracleConfig(replay_updates=int(args.oracle_replay_updates)),
         rnad=RNaDConfig(
             lambda_intra=float(args.lambda_intra),
+            lambda_inter=float(args.lambda_inter),
+            mask_unterminated_tail=bool(args.mask_unterminated_tail),
             alpha_rnad=float(args.alpha_rnad),
             outer_reset_steps=int(args.outer_reset_steps),
+            pfsp_snapshot_interval=int(args.pfsp_snapshot_interval),
             reset_warmup_steps=30,
             rho_mix_bc=float(args.rho_mix_bc),
             rho_mix_uniform=float(args.rho_mix_uniform),
+            entropy_coef=float(args.entropy_coef),
             policy_lr=float(args.policy_lr),
+            phoenix_7d_only=bool(args.phoenix_7d_only),
+            pfsp_frac=float(args.pfsp_frac),
+            opp_temperature=float(args.opp_temperature),
             freeze_belief=bool(args.freeze_belief),
             ron_k_max=max(8192, 2 * n_per_dev),
             warmup_updates=int(args.warmup_updates),
@@ -444,6 +459,9 @@ def main(argv: Optional[List[str]] = None) -> None:
             "p_riichi_legal": float(train_last.get("p_riichi_legal", 0.0)),
             "bc_kl": float(train_last.get("bc_kl", 0.0)),
             "riichi_adv_gap": float(train_last.get("riichi_adv_gap", 0.0)),
+            "riichi_pg": float(train_last.get("riichi_pg", 0.0)),
+            "oracle_r2": float(train_last.get("oracle_r2", 0.0)),
+            "oracle_r2_late": float(train_last.get("oracle_r2_late", 0.0)),
             "belief_pred_mean": float(train_last.get("belief_pred_mean", 0.0)),
             "is_best": bool(is_best),
             "eval_wall_s": float(ev["eval_wall_s"]),

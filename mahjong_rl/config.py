@@ -68,41 +68,51 @@ class GRPConfig:
 
 @dataclass(frozen=True)
 class OracleConfig:
-    """P1 Birkhoff Doubly-Stochastic History-State Dual-Horizon Oracle Critic."""
+    """P1 Birkhoff Doubly-Stochastic History-State Hybrid Tabular+Spatial Oracle Critic."""
 
-    num_blocks: int = 4
-    channels: int = 128
+    num_blocks: int = 1
+    channels: int = 48
     attn_heads: int = 4
-    global_hidden_dim: int = 128
+    global_hidden_dim: int = 48
+    tabular_hidden_dim: int = 192
+    head_hidden_dim: int = 128
     sinkhorn_iters: int = 50
-    # Dual-horizon training-only auxiliary heads (zero inference cost)
-    round_win_loss_coef: float = 0.20
-    round_score_loss_coef: float = 0.05
-    lr: float = 3e-4
-    weight_decay: float = 1e-4
+    tau_prior: float = 1.0
+    # Direct ego-weighted intra-round utility shift head + balanced Dual-Horizon auxiliary heads
+    delta_u_loss_coef: float = 25.0
+    ego_seat_loss_weight: float = 2.0
+    round_win_loss_coef: float = 0.05
+    round_score_loss_coef: float = 0.25
+    lr: float = 2e-4
+    weight_decay: float = 2e-2
     grad_clip_norm: float = 1.0
+    replay_updates: int = 6
+    update_epochs: int = 1
 
 
 @dataclass(frozen=True)
 class RNaDConfig:
     """P3 Clean Unbiased Asymmetric PPO + R-NaD + Triple-Armor Safety Shield + PFSP."""
 
-    # Dual-rate Simplex TD(lambda): round-horizon MC (lambda_intra=1.0) avoids ego-perspective critic bootstrap bias
-    lambda_intra: float = 1.0         # 1.0 = exact round-end return (no intra-round Oracle bootstrapping)
-    lambda_inter: float = 0.70        # Convex blend with GRP_EMA at round boundaries
+    # Dual-rate Simplex TD(lambda): exact round-end GRP evaluation (no intra-round or cross-round noise)
+    lambda_intra: float = 1.0         # 1.0 = exact round-horizon return (no intra-round Oracle bootstrapping)
+    lambda_inter: float = 0.0         # 0.0 = exact round-end GRP_EMA(s_{rend+1}) / terminal rank
+    mask_unterminated_tail: bool = True  # Exclude truncated rollout-tail rounds from policy/critic updates
 
     # Running-RMS advantage scaling (NO mean subtraction, active_mask only)
     running_rms_beta: float = 0.99
     running_rms_eps: float = 1e-5
 
-    # PPO-Clip + R-NaD discrete hard-reset magnet (tuned for gentle fine-tuning over 79% BC)
+    # PPO-Clip + R-NaD KL Magnet (outer_reset_steps=0 keeps permanent BC anchor)
     clip_eps: float = 0.20
-    alpha_rnad: float = 0.08
-    outer_reset_steps: int = 400      # 400 updates per outer epoch (~1.6M steps/epoch at B=32,T=128)
-    reset_warmup_steps: int = 30      # Short LR warmup after AdamW m_t surgical reset
-    # Dual-anchor entropy floor on rho_{k+1} = (1 - mix_bc - mix_u)*pi_k + mix_bc*pi_bc + mix_u*U_legal
+    alpha_rnad: float = 0.12
+    outer_reset_steps: int = 0        # 0 = permanent BC anchor; >0 resets rho_base periodically
+    pfsp_snapshot_interval: int = 200 # Snapshot interval into PFSP/outer pool when outer_reset_steps=0
+    reset_warmup_steps: int = 30      # Short LR warmup at Phase-2 entry / after outer reset
+    # Dual-anchor entropy floor on rho_{k+1} = (1 - mix_bc - mix_u)*rho_base + mix_bc*pi_bc + mix_u*U_legal
     rho_mix_bc: float = 0.10
-    rho_mix_uniform: float = 0.003
+    rho_mix_uniform: float = 0.005
+    entropy_coef: float = 0.002
 
     # Triple-Armor Softened Support-Set Safety Shield
     bc_soft_temp: float = 1.8
@@ -113,7 +123,7 @@ class RNaDConfig:
     shield_decay_scale: float = 0.30
 
     # Policy optimizer (isolated from Oracle & Belief)
-    policy_lr: float = 4e-5
+    policy_lr: float = 3e-5
     policy_weight_decay: float = 1e-4
     policy_grad_clip: float = 0.5
 
@@ -121,7 +131,10 @@ class RNaDConfig:
     freeze_belief: bool = True
     # Sparse static-capacity legal-ron compaction when freeze_belief=False (auto-floored to 2 * n_per_dev)
     ron_k_max: int = 8192
-    # Per-rollout single-snapshot PFSP elite pool size
+    # Meta-table pool & PFSP opponent sampling
+    phoenix_7d_only: bool = True
+    pfsp_frac: float = 0.625
+    opp_temperature: float = 0.35
     pfsp_pool_size: int = 8
     utility_dropout: float = 0.20
 
@@ -138,6 +151,7 @@ class RNaDConfig:
     min_distinct_deck_ratio: float = 0.95
     max_birkhoff_err: float = 1e-3
     max_p_riichi_legal: float = 0.78
+    safe_snapshot_max_p_riichi: float = 0.65
     riichi_probe_window: int = 5
     riichi_probe_min_samples: int = 160
     max_outer_snapshots: int = 5
@@ -173,9 +187,9 @@ class RLConfig:
     oracle: OracleConfig = field(default_factory=OracleConfig)
     rnad: RNaDConfig = field(default_factory=RNaDConfig)
 
-    # Single-GPU scaled rollout & optimization (B=32, T=128 -> 4096 transitions/update)
+    # Single-GPU scaled rollout & optimization (B=32, T=256 -> 8192 transitions/update)
     num_envs: int = 32
-    num_steps: int = 128
+    num_steps: int = 256
     num_updates: int = 12000          # ~49.2M env steps = 10 complete R-NaD outer epochs
     update_epochs: int = 2
     minibatch_size: int = 1024        # Micro-batch sized for <0.5GB dynamic activations
@@ -201,7 +215,15 @@ def make_dev_6gb_config() -> RLConfig:
         model=ModelConfig(num_blocks=2, channels=64, river_dim=16, attn_heads=4, global_hidden_dim=64),
         belief=BeliefConfig(num_blocks=2, channels=48, river_dim=16, attn_heads=4, global_hidden_dim=48),
         grp=GRPConfig(hidden_dim=64, num_layers=2),
-        oracle=OracleConfig(num_blocks=2, channels=64, attn_heads=4, global_hidden_dim=64),
+        oracle=OracleConfig(
+            num_blocks=1,
+            channels=48,
+            attn_heads=4,
+            global_hidden_dim=48,
+            tabular_hidden_dim=96,
+            head_hidden_dim=64,
+            replay_updates=2,
+        ),
         rnad=RNaDConfig(
             outer_reset_steps=20,
             reset_warmup_steps=5,

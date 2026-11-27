@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import math
 import os
 from pathlib import Path
 import pickle
@@ -54,6 +55,7 @@ from mahjong_rl.algo.sovereign_v6 import (
     ema_update_params,
     init_running_rms,
     masked_categorical_log_probs,
+    masked_categorical_probs,
     masked_mean,
     replicate_for_pmap,
     reset_adam_first_moment_only,
@@ -241,7 +243,7 @@ def train_rl_v6(
     grp_net = GRPNet(config=cfg.grp)
     oracle_net = OracleCriticNet(
         config=cfg.oracle,
-        tau_prior=cfg.grp.tau_prior,
+        tau_prior=cfg.oracle.tau_prior,
         river_dim=cfg.belief.river_dim,
     )
 
@@ -344,13 +346,41 @@ def train_rl_v6(
     if not pfsp_pool:
         pfsp_pool.append(_clone_host_params(params_pi))
 
-    w_tables, is_pfsp_env, learning_seat_mask = sample_meta_table_pool(cfg.num_envs, k_pool)
+    w_tables, is_pfsp_env, learning_seat_mask = sample_meta_table_pool(
+        cfg.num_envs,
+        k_pool,
+        phoenix_7d_only=cfg.rnad.phoenix_7d_only,
+        pfsp_frac=cfg.rnad.pfsp_frac,
+    )
+    is_pfsp_np = np.asarray(jax.device_get(is_pfsp_env), dtype=bool)
+    sp_idx_np = np.flatnonzero(~is_pfsp_np)
+    pfsp_idx_np = np.flatnonzero(is_pfsp_np)
+
     if use_pmap:
-        # Interleave Hom/PFSP/Het regimes evenly across GPUs before sharding (prevents 2x seat imbalance!)
-        interleave_idx = jnp.concatenate([jnp.arange(d, cfg.num_envs, n_devices) for d in range(n_devices)])
-        w_tables = w_tables[interleave_idx]
-        is_pfsp_env = is_pfsp_env[interleave_idx]
-        learning_seat_mask = learning_seat_mask[interleave_idx]
+        # Ensure equal static (n_sp_per_dev, n_pfsp_per_dev) per GPU while striding evenly across seats/rules
+        rem_pfsp = len(pfsp_idx_np) % n_devices
+        if rem_pfsp != 0:
+            move_to_sp = pfsp_idx_np[-rem_pfsp:]
+            pfsp_idx_np = pfsp_idx_np[:-rem_pfsp]
+            sp_idx_np = np.concatenate([sp_idx_np, move_to_sp])
+            move_j = jnp.asarray(move_to_sp, dtype=jnp.int32)
+            learning_seat_mask = learning_seat_mask.at[move_j].set(True)
+            is_pfsp_env = is_pfsp_env.at[move_j].set(False)
+        n_sp_per_dev = len(sp_idx_np) // n_devices
+        n_pfsp_per_dev = len(pfsp_idx_np) // n_devices
+        dev_orders = [
+            np.concatenate([sp_idx_np[d::n_devices], pfsp_idx_np[d::n_devices]])
+            for d in range(n_devices)
+        ]
+        reorder_idx = jnp.asarray(np.concatenate(dev_orders), dtype=jnp.int32)
+    else:
+        n_sp_per_dev = int(len(sp_idx_np))
+        n_pfsp_per_dev = int(len(pfsp_idx_np))
+        reorder_idx = jnp.asarray(np.concatenate([sp_idx_np, pfsp_idx_np]), dtype=jnp.int32)
+
+    w_tables = w_tables[reorder_idx]
+    is_pfsp_env = is_pfsp_env[reorder_idx]
+    learning_seat_mask = learning_seat_mask[reorder_idx]
 
     # Initialize parallel environments and stagger East-1..South-4 phases before sharding
     env_keys = jax.random.split(k_env, cfg.num_envs)
@@ -386,8 +416,9 @@ def train_rl_v6(
         roll_rng,
     ):
         grp_base_fn = lambda gf: grp_net.apply(p_grp_base, gf)
+        opp_temp = float(cfg.rnad.opp_temperature)
 
-        def eval_single_env_step(st, w_abs, l_mask_4, step_rng):
+        def eval_single_env_step(st, w_abs, l_mask_4, step_rng, is_self_play: bool):
             k_drop, k_act, k_step, k_reset = jax.random.split(step_rng, 4)
             clean_st = clean_auto_reset_state(st)
             cp = clean_st.current_player.astype(jnp.int32)
@@ -418,7 +449,7 @@ def train_rl_v6(
                 w_opp_5d=w_opp_5d,
                 temperature_cal=t_cal,
             )
-            _, grp_logits_base = grp_net.apply(p_grp_base, grp_f, return_logits=True)
+            grp_curr_4x4, grp_logits_base = grp_net.apply(p_grp_base, grp_f, return_logits=True)
 
             du_ron_3opp, du_ron_87, du_agari_3, du_ryu, call_threat = compute_analytical_trinity(
                 s_table=tbl,
@@ -462,13 +493,27 @@ def train_rl_v6(
                 legal_action_mask=legal_mask,
             )
             logits_pi = policy_net.apply(p_pi, **pol_kwargs)
-            logits_opp = policy_net.apply(p_opp, **pol_kwargs)
-
-            is_learn = l_mask_4[cp]
-            active_logits = jnp.where(is_learn, logits_pi, logits_opp)
-            log_p_act = masked_categorical_log_probs(active_logits, legal_mask)
-            action = jax.random.categorical(k_act, log_p_act).astype(jnp.int32)
-            old_log_p = log_p_act[action]
+            p_riichi_pi = masked_categorical_probs(logits_pi, legal_mask)[Action.RIICHI]
+            if is_self_play:
+                is_learn = jnp.bool_(True)
+                log_p_act = masked_categorical_log_probs(logits_pi, legal_mask)
+                action = jax.random.categorical(k_act, log_p_act).astype(jnp.int32)
+                old_log_p = log_p_act[action]
+            else:
+                logits_opp = policy_net.apply(p_opp, **pol_kwargs)
+                is_learn = l_mask_4[cp]
+                if opp_temp <= 0.0:
+                    opp_act = jnp.argmax(jnp.where(legal_mask, logits_opp, NEG_INF)).astype(jnp.int32)
+                    log_p_pi = masked_categorical_log_probs(logits_pi, legal_mask)
+                    act_pi = jax.random.categorical(k_act, log_p_pi).astype(jnp.int32)
+                    action = jnp.where(is_learn, act_pi, opp_act)
+                    old_log_p = jnp.where(is_learn, log_p_pi[action], jnp.float32(0.0))
+                else:
+                    scaled_opp = logits_opp / jnp.float32(opp_temp)
+                    active_logits = jnp.where(is_learn, logits_pi, scaled_opp)
+                    log_p_act = masked_categorical_log_probs(active_logits, legal_mask)
+                    action = jax.random.categorical(k_act, log_p_act).astype(jnp.int32)
+                    old_log_p = log_p_act[action]
 
             raw_next = env.step(clean_st, action, k_step)
             done = raw_next.terminated | raw_next.truncated
@@ -510,13 +555,17 @@ def train_rl_v6(
                 "delta_u_ryuukyoku": du_ryu,
                 "call_threat_plane": call_threat,
                 "grp_logits_base": grp_logits_base,
+                "grp_curr_4x4": grp_curr_4x4,
                 "grp_ema_next_4x4": grp_ema_next_4x4,
                 "v_oracle_4x4": ora_out["probs_4x4"],
+                "v_delta_u_ego": ora_out["delta_u_ego"],
+                "belief_pred_mean": jnp.mean(b_out["p_deal"]),
                 "term_rank_4x4": term_rank_4x4,
                 "w_table_ego": w_ego_4x4,
                 "w_opp_5d": w_opp_5d,
                 "action": action,
                 "old_log_prob": old_log_p,
+                "p_riichi": p_riichi_pi,
                 "legal_mask": legal_mask,
                 "current_player": cp.astype(jnp.int8),
                 "is_learn": is_learn,
@@ -526,6 +575,8 @@ def train_rl_v6(
                 "scores_post": scores_post,
                 "step_winner_abs": step_winner_abs.astype(jnp.int8),
             }
+            if cfg.rnad.freeze_belief:
+                trans["river_spatial_feat"] = b_out["river_spatial_feat"].astype(jnp.float16)
             if rsnap is not None:
                 trans["rsnap"] = rsnap
             return next_st, trans
@@ -534,7 +585,34 @@ def train_rl_v6(
             st_b, r = carry
             r, k_sub = jax.random.split(r)
             step_keys = jax.random.split(k_sub, envs_per_dev)
-            next_st_b, trans_b = jax.vmap(eval_single_env_step)(st_b, w_tab, learn_mask, step_keys)
+            parts_st, parts_tr = [], []
+            if n_sp_per_dev > 0:
+                st_sp, tr_sp = jax.vmap(
+                    lambda s, w, lm_, k: eval_single_env_step(s, w, lm_, k, is_self_play=True)
+                )(
+                    jax.tree_util.tree_map(lambda x: x[:n_sp_per_dev], st_b),
+                    w_tab[:n_sp_per_dev],
+                    learn_mask[:n_sp_per_dev],
+                    step_keys[:n_sp_per_dev],
+                )
+                parts_st.append(st_sp)
+                parts_tr.append(tr_sp)
+            if n_pfsp_per_dev > 0:
+                st_pf, tr_pf = jax.vmap(
+                    lambda s, w, lm_, k: eval_single_env_step(s, w, lm_, k, is_self_play=False)
+                )(
+                    jax.tree_util.tree_map(lambda x: x[n_sp_per_dev:], st_b),
+                    w_tab[n_sp_per_dev:],
+                    learn_mask[n_sp_per_dev:],
+                    step_keys[n_sp_per_dev:],
+                )
+                parts_st.append(st_pf)
+                parts_tr.append(tr_pf)
+            if len(parts_st) == 1:
+                next_st_b, trans_b = parts_st[0], parts_tr[0]
+            else:
+                next_st_b = jax.tree_util.tree_map(lambda a, b: jnp.concatenate([a, b], axis=0), parts_st[0], parts_st[1])
+                trans_b = jax.tree_util.tree_map(lambda a, b: jnp.concatenate([a, b], axis=0), parts_tr[0], parts_tr[1])
             return (next_st_b, r), trans_b
 
         (final_st_b, _), traj_tb = jax.lax.scan(
@@ -580,165 +658,353 @@ def train_rl_v6(
 
     rollout_fn = jax.pmap(_rollout_single_dev) if use_pmap else jax.jit(_rollout_single_dev)
 
+    n_total = cfg.num_envs * cfg.num_steps
+    n_per_dev = envs_per_dev * cfg.num_steps
+    mb_per_dev = min(cfg.minibatch_size // n_devices if use_pmap else cfg.minibatch_size, n_per_dev)
+    max_prep_c = max(mb_per_dev, min(n_per_dev, 256))
+    prep_chunk = max(d for d in range(1, min(n_per_dev, max_prep_c) + 1) if n_per_dev % d == 0)
+
     # =========================================================================
-    # JIT/PMAP 2: Dual-Rate Simplex TD + Running-RMS + Sparse K_max Ron Labeling
+    # JIT/PMAP 2: Dual-Rate Simplex TD + Tail Masking + Running-RMS + Cached Anchors
     # =========================================================================
-    def _prepare_single_dev(traj_tb, v_boot_b, rms_st):
-        # Transpose (T, B, ...) -> (B, T, ...)
-        traj_bt = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), traj_tb)
+    def _make_prepare_fn(precompute_bc_rho: bool):
+        def _prepare_single_dev(traj_tb, v_boot_b, rms_st, p_bc, p_rho_base):
+            # Transpose (T, B, ...) -> (B, T, ...)
+            traj_bt = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), traj_tb)
 
-        targets_4x4 = calculate_dual_rate_simplex_td_lambda(
-            v_oracle_4x4=traj_bt["v_oracle_4x4"],
-            v_bootstrap_4x4=v_boot_b,
-            grp_ema_next_4x4=traj_bt["grp_ema_next_4x4"],
-            terminal_rank_4x4=traj_bt["term_rank_4x4"],
-            dones=traj_bt["done"],
-            round_ended=traj_bt["round_ended"],
-            lambda_intra=cfg.rnad.lambda_intra,
-            lambda_inter=cfg.rnad.lambda_inter,
-        )  # (envs_per_dev, T, 4, 4)
+            targets_4x4 = calculate_dual_rate_simplex_td_lambda(
+                v_oracle_4x4=traj_bt["v_oracle_4x4"],
+                v_bootstrap_4x4=v_boot_b,
+                grp_ema_next_4x4=traj_bt["grp_ema_next_4x4"],
+                terminal_rank_4x4=traj_bt["term_rank_4x4"],
+                dones=traj_bt["done"],
+                round_ended=traj_bt["round_ended"],
+                lambda_intra=cfg.rnad.lambda_intra,
+                lambda_inter=cfg.rnad.lambda_inter,
+            )  # (envs_per_dev, T, 4, 4)
 
-        # Ego advantage: <(target - V_oracle)[cp], w_me>
-        b_idx = jnp.arange(envs_per_dev, dtype=jnp.int32)[:, None]
-        t_idx = jnp.arange(cfg.num_steps, dtype=jnp.int32)[None, :]
-        cp_bt = traj_bt["current_player"].astype(jnp.int32)
-        p_diff_me = targets_4x4[b_idx, t_idx, cp_bt] - traj_bt["v_oracle_4x4"][b_idx, t_idx, cp_bt]
-        w_me_bt = traj_bt["w_table_ego"][:, :, 0, :]
-        raw_adv = jnp.sum(p_diff_me * w_me_bt, axis=-1)
+            b_idx = jnp.arange(envs_per_dev, dtype=jnp.int32)[:, None]
+            t_idx = jnp.arange(cfg.num_steps, dtype=jnp.int32)[None, :]
+            cp_bt = traj_bt["current_player"].astype(jnp.int32)
 
-        num_legal = jnp.sum(traj_bt["legal_mask"].astype(jnp.int32), axis=-1)
-        active_mask = traj_bt["is_learn"] & (num_legal >= 2)
-        new_rms, scaled_adv, rms_val = update_running_rms(
-            rms_st,
-            raw_adv,
-            active_mask,
-            beta=cfg.rnad.running_rms_beta,
-            eps=cfg.rnad.running_rms_eps,
-        )
-        if use_pmap:
-            synced_sq = jax.lax.pmean(new_rms.second_moment, axis_name="devices")
-            synced_steps = jax.lax.pmax(new_rms.steps, axis_name="devices")
-            rms_val = jnp.sqrt(jnp.maximum(synced_sq, 0.0) + float(cfg.rnad.running_rms_eps))
-            scaled_adv = jnp.where(active_mask, raw_adv / rms_val, 0.0)
-            new_rms = RunningRMSState(second_moment=synced_sq, steps=synced_steps)
+            win_ego, score_delta_ego, aux_valid = compute_round_outcome_targets(
+                scores_curr=traj_bt["scores_curr"],
+                scores_post=traj_bt["scores_post"],
+                round_ended=traj_bt["round_ended"],
+                dones=traj_bt["done"],
+                step_winner_abs=traj_bt["step_winner_abs"],
+                current_players=cp_bt,
+            )
 
-        win_ego, score_delta_ego, aux_valid = compute_round_outcome_targets(
-            scores_curr=traj_bt["scores_curr"],
-            scores_post=traj_bt["scores_post"],
-            round_ended=traj_bt["round_ended"],
-            dones=traj_bt["done"],
-            step_winner_abs=traj_bt["step_winner_abs"],
-            current_players=cp_bt,
-        )
+            num_legal = jnp.sum(traj_bt["legal_mask"].astype(jnp.int32), axis=-1)
+            base_active = traj_bt["is_learn"] & (num_legal >= 2)
+            if cfg.rnad.mask_unterminated_tail:
+                comp_cnt = jnp.sum((base_active & aux_valid).astype(jnp.float32))
+                if use_pmap:
+                    comp_cnt = jax.lax.psum(comp_cnt, axis_name="devices")
+                round_valid = jnp.where(comp_cnt > 0.5, aux_valid, jnp.ones_like(aux_valid))
+            else:
+                round_valid = jnp.ones_like(aux_valid)
+            active_mask = base_active & round_valid
 
-        # Measure exact advantage gap between Action.RIICHI and dama/discard on riichi-legal states
-        can_r = active_mask & traj_bt["legal_mask"][..., Action.RIICHI]
-        did_r = can_r & (traj_bt["action"] == Action.RIICHI)
-        did_dama = can_r & (traj_bt["action"] != Action.RIICHI)
-        sum_r = jnp.sum(jnp.where(did_r, raw_adv, 0.0))
-        cnt_r = jnp.sum(did_r.astype(jnp.float32))
-        sum_d = jnp.sum(jnp.where(did_dama, raw_adv, 0.0))
-        cnt_d = jnp.sum(did_dama.astype(jnp.float32))
-        if use_pmap:
-            sum_r = jax.lax.psum(sum_r, axis_name="devices")
-            cnt_r = jax.lax.psum(cnt_r, axis_name="devices")
-            sum_d = jax.lax.psum(sum_d, axis_name="devices")
-            cnt_d = jax.lax.psum(cnt_d, axis_name="devices")
-        has_both_r = (cnt_r > 0.5) & (cnt_d > 0.5)
-        riichi_adv_gap = jnp.where(
-            has_both_r,
-            (sum_r / jnp.maximum(cnt_r, 1.0)) - (sum_d / jnp.maximum(cnt_d, 1.0)),
-            jnp.array(0.0, dtype=jnp.float32),
-        )
+            # Ego-frame target utility shift relative to frozen GRP_base(s_t) and advantage via delta_u_head
+            ego_seats = (cp_bt[:, :, None] + jnp.arange(4, dtype=jnp.int32)[None, None, :]) % 4
+            targets_ego = targets_4x4[b_idx[:, :, None], t_idx[:, :, None], ego_seats]
+            grp_curr_ego = traj_bt["grp_curr_4x4"][b_idx[:, :, None], t_idx[:, :, None], ego_seats]
+            delta_u_target_ego = jnp.sum((targets_ego - grp_curr_ego) * traj_bt["w_table_ego"], axis=-1)
+            raw_adv = delta_u_target_ego[..., 0] - traj_bt["v_delta_u_ego"][..., 0]
 
-        # Flatten (envs_per_dev, T, ...) -> (n_per_dev, ...)
-        n_per_dev = envs_per_dev * cfg.num_steps
-        flat = jax.tree_util.tree_map(lambda x: x.reshape((n_per_dev,) + x.shape[2:]), traj_bt)
-        flat["targets_4x4"] = targets_4x4.reshape((n_per_dev, 4, 4))
-        flat["adv_scaled"] = scaled_adv.reshape((n_per_dev,))
-        flat["win_ego"] = win_ego.reshape((n_per_dev,))
-        flat["score_delta_ego"] = score_delta_ego.reshape((n_per_dev, 4))
-        flat["aux_valid"] = aux_valid.reshape((n_per_dev,))
+            # Honest pre-update Oracle R^2 (overall & late-wall) and mean advantage on completed active steps
+            cnt_act = jnp.sum(active_mask.astype(jnp.float32))
+            y_true = delta_u_target_ego[..., 0]
+            sum_y = jnp.sum(jnp.where(active_mask, y_true, 0.0))
+            sum_adv = jnp.sum(jnp.where(active_mask, raw_adv, 0.0))
+            sum_sq_res = jnp.sum(jnp.where(active_mask, raw_adv ** 2, 0.0))
+            sum_y_sq = jnp.sum(jnp.where(active_mask, y_true ** 2, 0.0))
 
-        if cfg.rnad.freeze_belief:
-            ron_overflow = jnp.bool_(False)
-        else:
-            eff_ron_k_max = max(int(cfg.rnad.ron_k_max), 2 * n_per_dev)
-            y_ron, y_sb, y_ct, y_ten, ron_overflow = compute_sparse_belief_labels(
-                flat["rsnap"], k_max=eff_ron_k_max
+            late_mask = active_mask & (traj_bt["scalars"][..., 15] < (25.0 / 70.0))
+            cnt_late = jnp.sum(late_mask.astype(jnp.float32))
+            sum_y_late = jnp.sum(jnp.where(late_mask, y_true, 0.0))
+            sum_res_late = jnp.sum(jnp.where(late_mask, raw_adv ** 2, 0.0))
+            sum_y2_late = jnp.sum(jnp.where(late_mask, y_true ** 2, 0.0))
+
+            comp_frac = jnp.mean(aux_valid.astype(jnp.float32))
+            bel_pred_mean = jnp.mean(traj_bt["belief_pred_mean"])
+            if use_pmap:
+                cnt_act = jax.lax.psum(cnt_act, axis_name="devices")
+                sum_y = jax.lax.psum(sum_y, axis_name="devices")
+                sum_adv = jax.lax.psum(sum_adv, axis_name="devices")
+                sum_sq_res = jax.lax.psum(sum_sq_res, axis_name="devices")
+                sum_y_sq = jax.lax.psum(sum_y_sq, axis_name="devices")
+                cnt_late = jax.lax.psum(cnt_late, axis_name="devices")
+                sum_y_late = jax.lax.psum(sum_y_late, axis_name="devices")
+                sum_res_late = jax.lax.psum(sum_res_late, axis_name="devices")
+                sum_y2_late = jax.lax.psum(sum_y2_late, axis_name="devices")
+                comp_frac = jax.lax.pmean(comp_frac, axis_name="devices")
+                bel_pred_mean = jax.lax.pmean(bel_pred_mean, axis_name="devices")
+            denom_act = jnp.maximum(cnt_act, 1.0)
+            y_mean = sum_y / denom_act
+            adv_mean = sum_adv / denom_act
+            ss_tot = jnp.maximum(sum_y_sq - cnt_act * (y_mean ** 2), 1e-8)
+            oracle_r2 = jnp.where(cnt_act > 1.5, 1.0 - (sum_sq_res / ss_tot), jnp.array(0.0, dtype=jnp.float32))
+
+            y_mean_late = sum_y_late / jnp.maximum(cnt_late, 1.0)
+            ss_tot_late = jnp.maximum(sum_y2_late - cnt_late * (y_mean_late ** 2), 1e-8)
+            oracle_r2_late = jnp.where(
+                cnt_late > 1.5, 1.0 - (sum_res_late / ss_tot_late), jnp.array(0.0, dtype=jnp.float32)
+            )
+
+            new_rms, scaled_adv, rms_val = update_running_rms(
+                rms_st,
+                raw_adv,
+                active_mask,
+                beta=cfg.rnad.running_rms_beta,
+                eps=cfg.rnad.running_rms_eps,
             )
             if use_pmap:
-                ron_overflow = jax.lax.pmax(ron_overflow.astype(jnp.int32), axis_name="devices") > 0
-            flat["y_ron"] = y_ron
-            flat["y_score_bin"] = y_sb
-            flat["y_call_threat"] = y_ct
-            flat["y_tenpai"] = y_ten
-            del flat["rsnap"]
-        return flat, new_rms, rms_val, riichi_adv_gap, ron_overflow
+                synced_sq = jax.lax.pmean(new_rms.second_moment, axis_name="devices")
+                synced_steps = jax.lax.pmax(new_rms.steps, axis_name="devices")
+                rms_val = jnp.sqrt(jnp.maximum(synced_sq, 0.0) + float(cfg.rnad.running_rms_eps))
+                scaled_adv = jnp.where(active_mask, raw_adv / rms_val, 0.0)
+                new_rms = RunningRMSState(second_moment=synced_sq, steps=synced_steps)
 
-    prepare_batch_fn = (
-        jax.pmap(_prepare_single_dev, axis_name="devices") if use_pmap else jax.jit(_prepare_single_dev)
-    )
+            # Measure both confounded gap and unconfounded REINFORCE Riichi gradient E[(1_R - p_R) * A]
+            can_r = active_mask & traj_bt["legal_mask"][..., Action.RIICHI]
+            did_r = can_r & (traj_bt["action"] == Action.RIICHI)
+            did_dama = can_r & (traj_bt["action"] != Action.RIICHI)
+            sum_r = jnp.sum(jnp.where(did_r, raw_adv, 0.0))
+            cnt_r = jnp.sum(did_r.astype(jnp.float32))
+            sum_d = jnp.sum(jnp.where(did_dama, raw_adv, 0.0))
+            cnt_d = jnp.sum(did_dama.astype(jnp.float32))
+            ind_r = (traj_bt["action"] == Action.RIICHI).astype(jnp.float32)
+            pg_r_sum = jnp.sum(jnp.where(can_r, (ind_r - traj_bt["p_riichi"]) * raw_adv, 0.0))
+            pg_r_cnt = jnp.sum(can_r.astype(jnp.float32))
+            if use_pmap:
+                sum_r = jax.lax.psum(sum_r, axis_name="devices")
+                cnt_r = jax.lax.psum(cnt_r, axis_name="devices")
+                sum_d = jax.lax.psum(sum_d, axis_name="devices")
+                cnt_d = jax.lax.psum(cnt_d, axis_name="devices")
+                pg_r_sum = jax.lax.psum(pg_r_sum, axis_name="devices")
+                pg_r_cnt = jax.lax.psum(pg_r_cnt, axis_name="devices")
+            has_both_r = (cnt_r > 0.5) & (cnt_d > 0.5)
+            riichi_adv_gap = jnp.where(
+                has_both_r,
+                (sum_r / jnp.maximum(cnt_r, 1.0)) - (sum_d / jnp.maximum(cnt_d, 1.0)),
+                jnp.array(0.0, dtype=jnp.float32),
+            )
+            riichi_pg = jnp.where(
+                pg_r_cnt > 0.5,
+                pg_r_sum / jnp.maximum(pg_r_cnt, 1.0),
+                jnp.array(0.0, dtype=jnp.float32),
+            )
+
+            # Pack strictly required arrays for minibatch updates
+            keep_keys = [
+                "planes",
+                "oracle_planes",
+                "scalars",
+                "w_table_ego",
+                "grp_logits_base",
+                "current_player",
+            ]
+            if cfg.rnad.freeze_belief:
+                keep_keys.append("river_spatial_feat")
+            else:
+                keep_keys.extend(["river_tokens", "river_tile_ids", "river_valid_mask", "w_opp_5d"])
+            if precompute_bc_rho:
+                keep_keys.extend([
+                    "river_tokens",
+                    "river_tile_ids",
+                    "river_valid_mask",
+                    "last_draw_type",
+                    "is_last_draw_red",
+                    "target_type",
+                    "target_is_red",
+                    "delta_u_ron_3opp",
+                    "delta_u_ron_87",
+                    "delta_u_agari_3",
+                    "delta_u_ryuukyoku",
+                    "call_threat_plane",
+                    "action",
+                    "old_log_prob",
+                    "legal_mask",
+                ])
+            flat = {
+                k: traj_bt[k].reshape((n_per_dev,) + traj_bt[k].shape[2:])
+                for k in dict.fromkeys(keep_keys)
+            }
+            flat["targets_4x4"] = targets_4x4.reshape((n_per_dev, 4, 4))
+            flat["delta_u_target_ego"] = delta_u_target_ego.reshape((n_per_dev, 4))
+            flat["round_valid"] = round_valid.reshape((n_per_dev,))
+            flat["win_ego"] = win_ego.reshape((n_per_dev,))
+            flat["score_delta_ego"] = score_delta_ego.reshape((n_per_dev, 4))
+            flat["aux_valid"] = aux_valid.reshape((n_per_dev,))
+
+            if precompute_bc_rho:
+                flat["adv_scaled"] = scaled_adv.reshape((n_per_dev,))
+                flat["is_learn_eff"] = (traj_bt["is_learn"] & round_valid).reshape((n_per_dev,))
+
+                def _eval_bc_rho_chunk(_, chunk):
+                    mask_c = chunk["legal_mask"]
+                    pol_in = dict(
+                        planes=chunk["planes"],
+                        delta_u_ron_3opp=chunk["delta_u_ron_3opp"],
+                        call_threat_plane=chunk["call_threat_plane"],
+                        scalars=chunk["scalars"],
+                        river_tokens=chunk["river_tokens"],
+                        river_tile_ids=chunk["river_tile_ids"].astype(jnp.int32),
+                        river_valid_mask=chunk["river_valid_mask"],
+                        last_draw_type=chunk["last_draw_type"].astype(jnp.int32),
+                        is_last_draw_red=chunk["is_last_draw_red"],
+                        target_type=chunk["target_type"].astype(jnp.int32),
+                        target_is_red=chunk["target_is_red"],
+                        w_ego=chunk["w_table_ego"][:, 0, :],
+                        delta_u_agari_3=chunk["delta_u_agari_3"],
+                        delta_u_ryuukyoku=chunk["delta_u_ryuukyoku"],
+                        delta_u_ron_87=chunk["delta_u_ron_87"],
+                        legal_action_mask=mask_c,
+                    )
+                    bc_lg = jax.lax.stop_gradient(policy_net.apply(p_bc, **pol_in))
+                    if int(cfg.rnad.outer_reset_steps) <= 0:
+                        rho_lg = bc_lg
+                    else:
+                        rho_lg = jax.lax.stop_gradient(policy_net.apply(p_rho_base, **pol_in))
+                    _, log_rho_c = compute_dual_anchor_rho_probs(
+                        rho_lg,
+                        bc_lg,
+                        mask_c,
+                        mix_bc=cfg.rnad.rho_mix_bc,
+                        mix_uniform=cfg.rnad.rho_mix_uniform,
+                    )
+                    return None, (bc_lg.astype(jnp.float32), log_rho_c.astype(jnp.float32))
+
+                n_chunks = n_per_dev // prep_chunk
+                chunk_keys = (
+                    "planes",
+                    "delta_u_ron_3opp",
+                    "call_threat_plane",
+                    "scalars",
+                    "river_tokens",
+                    "river_tile_ids",
+                    "river_valid_mask",
+                    "last_draw_type",
+                    "is_last_draw_red",
+                    "target_type",
+                    "target_is_red",
+                    "w_table_ego",
+                    "delta_u_agari_3",
+                    "delta_u_ryuukyoku",
+                    "delta_u_ron_87",
+                    "legal_mask",
+                )
+                chunk_in = {
+                    k: flat[k].reshape((n_chunks, prep_chunk) + flat[k].shape[1:])
+                    for k in chunk_keys
+                }
+                _, (bc_lg_c, log_rho_c) = jax.lax.scan(_eval_bc_rho_chunk, None, chunk_in)
+                flat["bc_logits"] = bc_lg_c.reshape((n_per_dev, Action.NUM_ACTION))
+                flat["log_rho"] = log_rho_c.reshape((n_per_dev, Action.NUM_ACTION))
+
+            if cfg.rnad.freeze_belief:
+                ron_overflow = jnp.bool_(False)
+            else:
+                eff_ron_k_max = max(int(cfg.rnad.ron_k_max), 2 * n_per_dev)
+                rsnap_flat = jax.tree_util.tree_map(
+                    lambda x: x.reshape((n_per_dev,) + x.shape[2:]), traj_bt["rsnap"]
+                )
+                y_ron, y_sb, y_ct, y_ten, ron_overflow = compute_sparse_belief_labels(
+                    rsnap_flat, k_max=eff_ron_k_max
+                )
+                if use_pmap:
+                    ron_overflow = jax.lax.pmax(ron_overflow.astype(jnp.int32), axis_name="devices") > 0
+                flat["y_ron"] = y_ron
+                flat["y_score_bin"] = y_sb
+                flat["y_call_threat"] = y_ct
+                flat["y_tenpai"] = y_ten
+            return (
+                flat,
+                new_rms,
+                rms_val,
+                riichi_adv_gap,
+                riichi_pg,
+                oracle_r2,
+                oracle_r2_late,
+                adv_mean,
+                comp_frac,
+                bel_pred_mean,
+                ron_overflow,
+            )
+
+        return jax.pmap(_prepare_single_dev, axis_name="devices") if use_pmap else jax.jit(_prepare_single_dev)
+
+    prepare_warmup_fn = _make_prepare_fn(precompute_bc_rho=False)
+    prepare_full_fn = _make_prepare_fn(precompute_bc_rho=True)
 
     # =========================================================================
-    # JIT/PMAP 3: Isolated 3-Chain Minibatch Update (Warmup vs Full RL)
+    # JIT/PMAP 3: Decoupled Isolated Optimizers (`update_ora_mb` + `update_bel_pi_mb`)
     # =========================================================================
-    def _make_update_step(update_policy: bool):
-        def step_fn(
-            p_pi,
-            o_pi,
-            p_ora,
-            o_ora,
-            p_b_fast,
-            o_bel,
-            p_b_ema,
-            p_bc,
-            p_rho_base,
-            mb,
-            shield_lam,
-            t_cal,
-            ron_overflow,
-        ):
+    def _ora_step_fn(p_ora, o_ora, p_b_ema, mb_ora, t_cal):
+        if cfg.rnad.freeze_belief:
+            river_feat = jax.lax.stop_gradient(mb_ora["river_spatial_feat"].astype(jnp.float32))
+        else:
             b_ema_out = belief_net.apply(
                 p_b_ema,
-                planes=mb["planes"],
-                scalars=mb["scalars"],
-                river_tokens=mb["river_tokens"],
-                river_tile_ids=mb["river_tile_ids"].astype(jnp.int32),
-                river_valid_mask=mb["river_valid_mask"],
-                w_opp_5d=mb["w_opp_5d"],
+                planes=mb_ora["planes"],
+                scalars=mb_ora["scalars"],
+                river_tokens=mb_ora["river_tokens"],
+                river_tile_ids=mb_ora["river_tile_ids"].astype(jnp.int32),
+                river_valid_mask=mb_ora["river_valid_mask"],
+                w_opp_5d=mb_ora["w_opp_5d"],
                 temperature_cal=t_cal,
             )
             river_feat = jax.lax.stop_gradient(b_ema_out["river_spatial_feat"])
 
-            # 1. Oracle Update (Isolated chain tx_oracle)
-            def ora_loss_fn(p):
-                out = oracle_net.apply(
-                    p,
-                    planes=mb["planes"],
-                    oracle_planes=mb["oracle_planes"],
-                    scalars=mb["scalars"],
-                    w_table_ego=mb["w_table_ego"],
-                    grp_logits_abs=mb["grp_logits_base"],
-                    current_player=mb["current_player"].astype(jnp.int32),
-                    river_spatial_feat=river_feat,
-                )
-                return compute_oracle_loss_v6(
-                    out,
-                    targets_4x4=mb["targets_4x4"],
-                    round_winner_ego=mb["win_ego"],
-                    round_score_delta_ego=mb["score_delta_ego"],
-                    aux_valid=mb["aux_valid"],
-                    cfg=cfg.oracle,
-                )
+        def ora_loss_fn(p):
+            out = oracle_net.apply(
+                p,
+                planes=mb_ora["planes"].astype(jnp.float32),
+                oracle_planes=mb_ora["oracle_planes"].astype(jnp.float32),
+                scalars=mb_ora["scalars"],
+                w_table_ego=mb_ora["w_table_ego"],
+                grp_logits_abs=mb_ora["grp_logits_base"],
+                current_player=mb_ora["current_player"].astype(jnp.int32),
+                river_spatial_feat=river_feat,
+            )
+            return compute_oracle_loss_v6(
+                out,
+                targets_4x4=mb_ora["targets_4x4"],
+                round_winner_ego=mb_ora["win_ego"],
+                round_score_delta_ego=mb_ora["score_delta_ego"],
+                aux_valid=mb_ora["aux_valid"],
+                cfg=cfg.oracle,
+                delta_u_target_ego=mb_ora["delta_u_target_ego"],
+                valid_mask=mb_ora["round_valid"],
+            )
 
-            (_, ora_metrics), g_ora = jax.value_and_grad(ora_loss_fn, has_aux=True)(p_ora)
-            if use_pmap:
-                g_ora = jax.lax.pmean(g_ora, axis_name="devices")
-            u_ora, o_ora = tx_oracle.update(g_ora, o_ora, p_ora)
-            p_ora = optax.apply_updates(p_ora, u_ora)
+        (_, ora_metrics), g_ora = jax.value_and_grad(ora_loss_fn, has_aux=True)(p_ora)
+        if use_pmap:
+            g_ora = jax.lax.pmean(g_ora, axis_name="devices")
+        u_ora, o_ora = tx_oracle.update(g_ora, o_ora, p_ora)
+        p_ora = optax.apply_updates(p_ora, u_ora)
+        out_metrics = {**ora_metrics, "ora_finite_grads": _tree_is_finite(g_ora).astype(jnp.float32)}
+        if use_pmap:
+            out_metrics = jax.lax.pmean(out_metrics, axis_name="devices")
+        return p_ora, o_ora, out_metrics
 
-            # 2. Belief Update (frozen by default; if enabled, guarded against ron_k_max overflow)
+    update_ora_mb = jax.pmap(_ora_step_fn, axis_name="devices") if use_pmap else jax.jit(_ora_step_fn)
+
+    def _make_bel_pi_step(update_policy: bool):
+        def step_fn(
+            p_pi,
+            o_pi,
+            p_b_fast,
+            o_bel,
+            p_b_ema,
+            mb,
+            shield_lam,
+            ron_overflow,
+        ):
+            # 1. Belief Update (frozen by default; if enabled, guarded against ron_k_max overflow)
             if not cfg.rnad.freeze_belief:
                 def bel_loss_fn(p):
                     out = belief_net.apply(
@@ -776,7 +1042,7 @@ def train_rl_v6(
                     _apply_bel,
                     None,
                 )
-                finite_all = _tree_is_finite(g_ora) & (ron_overflow | _tree_is_finite(g_bel))
+                finite_all = ron_overflow | _tree_is_finite(g_bel)
             else:
                 bel_metrics = {
                     "belief_loss": jnp.array(0.0, dtype=jnp.float32),
@@ -785,11 +1051,11 @@ def train_rl_v6(
                     "belief_call_bce": jnp.array(0.0, dtype=jnp.float32),
                     "belief_tenpai_bce": jnp.array(0.0, dtype=jnp.float32),
                     "belief_pos_rate": jnp.array(0.0, dtype=jnp.float32),
-                    "belief_pred_mean": jnp.mean(b_ema_out["p_deal"]),
+                    "belief_pred_mean": jnp.array(0.0, dtype=jnp.float32),
                 }
-                finite_all = _tree_is_finite(g_ora)
+                finite_all = jnp.bool_(True)
 
-            # 3. Policy Update (Isolated chain tx_policy — skipped in Phase 1 warmup!)
+            # 2. Policy Update (Isolated chain tx_policy — skipped in Phase 1 warmup!)
             if update_policy:
                 pol_in = dict(
                     planes=mb["planes"],
@@ -809,15 +1075,8 @@ def train_rl_v6(
                     delta_u_ron_87=mb["delta_u_ron_87"],
                     legal_action_mask=mb["legal_mask"],
                 )
-                bc_logits = jax.lax.stop_gradient(policy_net.apply(p_bc, **pol_in))
-                rho_base_logits = jax.lax.stop_gradient(policy_net.apply(p_rho_base, **pol_in))
-                _, log_rho = compute_dual_anchor_rho_probs(
-                    rho_base_logits,
-                    bc_logits,
-                    mb["legal_mask"],
-                    mix_bc=cfg.rnad.rho_mix_bc,
-                    mix_uniform=cfg.rnad.rho_mix_uniform,
-                )
+                bc_logits = jax.lax.stop_gradient(mb["bc_logits"])
+                log_rho = jax.lax.stop_gradient(mb["log_rho"])
 
                 def pi_loss_fn(p):
                     logits, aux = policy_net.apply(p, return_aux=True, **pol_in)
@@ -829,7 +1088,7 @@ def train_rl_v6(
                         log_rho=log_rho,
                         bc_logits=bc_logits,
                         legal_mask=mb["legal_mask"],
-                        learning_seat_mask=mb["is_learn"],
+                        learning_seat_mask=mb["is_learn_eff"],
                         cfg=cfg.rnad,
                         shield_lambda=shield_lam,
                     )
@@ -864,22 +1123,19 @@ def train_rl_v6(
                     "beta_offense": jnp.array(0.0, dtype=jnp.float32),
                 }
 
-            all_metrics = {**ora_metrics, **bel_metrics, **pi_metrics, "finite_grads": finite_all.astype(jnp.float32)}
+            all_metrics = {**bel_metrics, **pi_metrics, "finite_grads": finite_all.astype(jnp.float32)}
             if use_pmap:
                 all_metrics = jax.lax.pmean(all_metrics, axis_name="devices")
-            return p_pi, o_pi, p_ora, o_ora, p_b_fast, o_bel, p_b_ema, all_metrics
+            return p_pi, o_pi, p_b_fast, o_bel, p_b_ema, all_metrics
 
         return jax.pmap(step_fn, axis_name="devices") if use_pmap else jax.jit(step_fn)
 
-    update_mb_warmup = _make_update_step(update_policy=False)
-    update_mb_full = _make_update_step(update_policy=True)
+    update_bel_pi_warmup = None if cfg.rnad.freeze_belief else _make_bel_pi_step(update_policy=False)
+    update_bel_pi_full = _make_bel_pi_step(update_policy=True)
 
     # =========================================================================
     # Main Training Loop (Phase 1 Warmup -> Phase 2 Sovereign V6 RL)
     # =========================================================================
-    n_total = cfg.num_envs * cfg.num_steps
-    n_per_dev = envs_per_dev * cfg.num_steps
-    mb_per_dev = min(cfg.minibatch_size // n_devices if use_pmap else cfg.minibatch_size, n_per_dev)
     t_cal_arr = _rep(jnp.asarray(belief_t_cal, dtype=jnp.float32))
 
     # Replicate states across all GPUs if multi-GPU `pmap` is active
@@ -966,12 +1222,56 @@ def train_rl_v6(
     phase2_step = max(0, start_update - int(cfg.rnad.warmup_updates))
     aborted = False
 
+    ORA_BUF_KEYS = (
+        "planes",
+        "oracle_planes",
+        "scalars",
+        "w_table_ego",
+        "grp_logits_base",
+        "current_player",
+        "river_spatial_feat",
+        "targets_4x4",
+        "delta_u_target_ego",
+        "win_ego",
+        "score_delta_ego",
+        "aux_valid",
+        "round_valid",
+    )
+    ORA_FP16_KEYS = frozenset(("planes", "oracle_planes", "river_spatial_feat"))
+    ora_src_keys = (
+        "planes",
+        "oracle_planes",
+        "scalars",
+        "w_table_ego",
+        "grp_logits_base",
+        "current_player",
+        "targets_4x4",
+        "delta_u_target_ego",
+        "win_ego",
+        "score_delta_ego",
+        "aux_valid",
+        "round_valid",
+    ) + (
+        ("river_spatial_feat",)
+        if cfg.rnad.freeze_belief
+        else ("river_tokens", "river_tile_ids", "river_valid_mask", "w_opp_5d")
+    )
+    use_ora_replay = bool(cfg.rnad.freeze_belief and int(cfg.oracle.replay_updates) > 1)
+    ora_replay: Deque[Dict[str, np.ndarray]] = deque(maxlen=max(1, int(cfg.oracle.replay_updates)))
+    n_mb_per_epoch = max(1, n_per_dev // mb_per_dev)
+    ora_update_epochs = max(1, int(cfg.oracle.update_epochs))
+
     for upd in range(start_update, cfg.num_updates):
         t_upd_start = time.perf_counter()
         in_warmup = not warmup_unlocked
 
-        # Outer R-NaD hard reset at every `outer_reset_steps` in Phase 2
-        if (not in_warmup) and phase2_step > 0 and (phase2_step % int(cfg.rnad.outer_reset_steps) == 0):
+        # Outer R-NaD hard reset at every `outer_reset_steps` (when > 0) or healthy PFSP snapshotting (when <= 0)
+        if (
+            (not in_warmup)
+            and int(cfg.rnad.outer_reset_steps) > 0
+            and phase2_step > 0
+            and (phase2_step % int(cfg.rnad.outer_reset_steps) == 0)
+        ):
             snap = _clone_host_params(_unrep(params_pi))
             pfsp_pool.append(snap)
             outer_snapshots.append(snap)
@@ -980,6 +1280,19 @@ def train_rl_v6(
             opt_pi = _rep(reset_adam_first_moment_only(_unrep(opt_pi)))
             steps_since_outer_reset = 0
             last_eff_lr = None
+        elif (
+            (not in_warmup)
+            and int(cfg.rnad.outer_reset_steps) <= 0
+            and int(cfg.rnad.pfsp_snapshot_interval) > 0
+            and phase2_step > 0
+            and (phase2_step % int(cfg.rnad.pfsp_snapshot_interval) == 0)
+            and history
+            and history[-1].get("healed", 0.0) < 0.5
+            and healer.is_snapshot_safe(history[-1])
+        ):
+            snap = _clone_host_params(_unrep(params_pi))
+            pfsp_pool.append(snap)
+            outer_snapshots.append(snap)
 
         # Apply smooth post-reset & Phase-2-entry warmup + self-healing LR scaling (zero-copy!)
         if in_warmup:
@@ -994,8 +1307,8 @@ def train_rl_v6(
             opt_pi = set_injected_lr(opt_pi, eff_lr, n_devices=n_devices if use_pmap else 1)
             last_eff_lr = eff_lr
 
-        # Per-Rollout Single-Snapshot PFSP sampling (25% permanent BC anchor + cached device weights)
-        if len(pfsp_pool) > 1 and np_rng.random() < 0.25:
+        # Per-Rollout Single-Snapshot PFSP sampling (50% permanent BC anchor + cached device weights)
+        if len(pfsp_pool) > 1 and np_rng.random() < 0.50:
             params_opp = params_bc_exec
         else:
             opp_idx = int(np_rng.integers(0, len(pfsp_pool)))
@@ -1027,8 +1340,21 @@ def train_rl_v6(
         decks_sig = raw_decks.reshape((cfg.num_envs, -1))[:, :8]
         distinct_ratio = len({row.tobytes() for row in decks_sig}) / max(cfg.num_envs, 1)
 
-        flat_batch, rms_state, rms_val, riichi_adv_gap_arr, ron_overflow_flag = prepare_batch_fn(
-            traj_tb, v_boot_b, rms_state
+        prepare_fn = prepare_warmup_fn if in_warmup else prepare_full_fn
+        (
+            flat_batch,
+            rms_state,
+            rms_val,
+            riichi_adv_gap_arr,
+            riichi_pg_arr,
+            oracle_r2_arr,
+            oracle_r2_late_arr,
+            adv_mean_arr,
+            comp_frac_arr,
+            bel_pred_mean_arr,
+            ron_overflow_flag,
+        ) = prepare_fn(
+            traj_tb, v_boot_b, rms_state, params_bc_exec, params_rho_base
         )
         ron_overflow_host = bool(np.asarray(jax.device_get(_unrep(ron_overflow_flag))))
         if ron_overflow_host and verbose:
@@ -1042,58 +1368,164 @@ def train_rl_v6(
         shield_lam_val = compute_shield_lambda(progress, cfg.rnad)
         shield_lam = _rep(jnp.asarray(shield_lam_val, dtype=jnp.float32))
 
-        step_fn = update_mb_warmup if in_warmup else update_mb_full
         upd_metrics_acc: Dict[str, List[float]] = {}
         all_finite = True
 
-        for _ in range(cfg.update_epochs):
-            perm = np_rng.permutation(n_per_dev)
-            for start in range(0, n_per_dev, mb_per_dev):
-                idx_np = perm[start : start + mb_per_dev]
-                if idx_np.size < mb_per_dev:
-                    continue
-                idx_j = jnp.asarray(idx_np, dtype=jnp.int32)
-                if use_pmap:
-                    mb = jax.tree_util.tree_map(lambda x: x[:, idx_j], flat_batch)
-                else:
-                    mb = jax.tree_util.tree_map(lambda x: x[idx_j], flat_batch)
-                (
-                    params_pi,
-                    opt_pi,
-                    params_oracle,
-                    opt_oracle,
-                    params_b_fast,
-                    opt_belief,
-                    params_b_ema,
-                    m_dict,
-                ) = step_fn(
-                    params_pi,
-                    opt_pi,
-                    params_oracle,
-                    opt_oracle,
-                    params_b_fast,
-                    opt_belief,
-                    params_b_ema,
-                    params_bc_exec,
-                    params_rho_base,
-                    mb,
-                    shield_lam,
-                    t_cal_arr,
-                    ron_overflow_flag,
-                )
-                m_single = _unrep(m_dict)
-                if float(m_single["finite_grads"]) < 0.5:
-                    all_finite = False
-                for mk, mv in m_single.items():
-                    upd_metrics_acc.setdefault(mk, []).append(float(mv))
+        # 1. Decoupled Oracle Update (host-RAM sliding replay when freeze_belief & replay_updates > 1)
+        if use_ora_replay:
+            rv_raw = np.asarray(jax.device_get(flat_batch["round_valid"]), dtype=bool)
+            rv_np = rv_raw.reshape((n_devices * n_per_dev,)) if use_pmap else rv_raw.reshape((n_per_dev,))
+            if bool(np.any(rv_np)):
+                chunk_host: Dict[str, np.ndarray] = {}
+                for k in ORA_BUF_KEYS:
+                    a_np = np.asarray(jax.device_get(flat_batch[k]))
+                    if use_pmap:
+                        a_np = a_np.reshape((n_devices * n_per_dev,) + a_np.shape[2:])
+                    a_val = a_np[rv_np]
+                    if k in ORA_FP16_KEYS:
+                        a_val = a_val.astype(np.float16, copy=False)
+                    chunk_host[k] = a_val
+                ora_replay.append(chunk_host)
 
-        jax.block_until_ready(params_pi)
+            if ora_replay:
+                chunks_list = list(ora_replay)
+                lengths = np.array([len(c["round_valid"]) for c in chunks_list], dtype=np.int64)
+                cum = np.cumsum(lengths)
+                starts = np.empty_like(cum)
+                starts[0] = 0
+                starts[1:] = cum[:-1]
+                total_rows = int(cum[-1])
+                mb_total = mb_per_dev * (n_devices if use_pmap else 1)
+                n_ora_mbs = ora_update_epochs * n_mb_per_epoch
+                for _ in range(n_ora_mbs):
+                    g_idx = np_rng.integers(0, total_rows, size=mb_total)
+                    chunk_ids = np.searchsorted(cum, g_idx, side="right")
+                    local_ids = g_idx - starts[chunk_ids]
+                    order_masks = [
+                        (cid, np.flatnonzero(chunk_ids == cid))
+                        for cid in range(len(chunks_list))
+                        if np.any(chunk_ids == cid)
+                    ]
+                    mb_ora_host: Dict[str, np.ndarray] = {}
+                    for k in ORA_BUF_KEYS:
+                        sample_leaf = chunks_list[0][k]
+                        buf = np.empty((mb_total,) + sample_leaf.shape[1:], dtype=sample_leaf.dtype)
+                        for cid, pos in order_masks:
+                            buf[pos] = chunks_list[cid][k][local_ids[pos]]
+                        if use_pmap:
+                            buf = buf.reshape((n_devices, mb_per_dev) + buf.shape[1:])
+                        mb_ora_host[k] = buf
+                    mb_ora = (
+                        shard_for_pmap(mb_ora_host, n_devices)
+                        if use_pmap
+                        else jax.tree_util.tree_map(jax.device_put, mb_ora_host)
+                    )
+                    params_oracle, opt_oracle, m_ora_dict = update_ora_mb(
+                        params_oracle, opt_oracle, params_b_ema, mb_ora, t_cal_arr
+                    )
+                    m_ora_single = _unrep(m_ora_dict)
+                    if float(m_ora_single["ora_finite_grads"]) < 0.5:
+                        all_finite = False
+                    for mk, mv in m_ora_single.items():
+                        upd_metrics_acc.setdefault(mk, []).append(float(mv))
+        else:
+            for _ in range(ora_update_epochs):
+                perm_o = np_rng.permutation(n_per_dev)
+                for start in range(0, n_per_dev, mb_per_dev):
+                    idx_np = perm_o[start : start + mb_per_dev]
+                    if idx_np.size < mb_per_dev:
+                        continue
+                    idx_j = jnp.asarray(idx_np, dtype=jnp.int32)
+                    if use_pmap:
+                        mb_ora = {k: flat_batch[k][:, idx_j] for k in ora_src_keys}
+                    else:
+                        mb_ora = {k: flat_batch[k][idx_j] for k in ora_src_keys}
+                    params_oracle, opt_oracle, m_ora_dict = update_ora_mb(
+                        params_oracle, opt_oracle, params_b_ema, mb_ora, t_cal_arr
+                    )
+                    m_ora_single = _unrep(m_ora_dict)
+                    if float(m_ora_single["ora_finite_grads"]) < 0.5:
+                        all_finite = False
+                    for mk, mv in m_ora_single.items():
+                        upd_metrics_acc.setdefault(mk, []).append(float(mv))
+
+        # 2. Strictly On-Policy Belief / Policy Update (skipped during warmup when freeze_belief=True)
+        bel_pi_step_fn = update_bel_pi_warmup if in_warmup else update_bel_pi_full
+        if bel_pi_step_fn is not None:
+            for _ in range(cfg.update_epochs):
+                perm = np_rng.permutation(n_per_dev)
+                for start in range(0, n_per_dev, mb_per_dev):
+                    idx_np = perm[start : start + mb_per_dev]
+                    if idx_np.size < mb_per_dev:
+                        continue
+                    idx_j = jnp.asarray(idx_np, dtype=jnp.int32)
+                    if use_pmap:
+                        mb = jax.tree_util.tree_map(lambda x: x[:, idx_j], flat_batch)
+                    else:
+                        mb = jax.tree_util.tree_map(lambda x: x[idx_j], flat_batch)
+                    (
+                        params_pi,
+                        opt_pi,
+                        params_b_fast,
+                        opt_belief,
+                        params_b_ema,
+                        m_dict,
+                    ) = bel_pi_step_fn(
+                        params_pi,
+                        opt_pi,
+                        params_b_fast,
+                        opt_belief,
+                        params_b_ema,
+                        mb,
+                        shield_lam,
+                        ron_overflow_flag,
+                    )
+                    m_single = _unrep(m_dict)
+                    if float(m_single["finite_grads"]) < 0.5:
+                        all_finite = False
+                    for mk, mv in m_single.items():
+                        upd_metrics_acc.setdefault(mk, []).append(float(mv))
+        else:
+            for mk, mv in (
+                ("belief_loss", 0.0),
+                ("belief_deal_bce", 0.0),
+                ("belief_score_ce", 0.0),
+                ("belief_call_bce", 0.0),
+                ("belief_tenpai_bce", 0.0),
+                ("belief_pos_rate", 0.0),
+                ("belief_pred_mean", 0.0),
+                ("policy_loss", 0.0),
+                ("ppo_loss", 0.0),
+                ("rnad_kl", 0.0),
+                ("bc_kl", 0.0),
+                ("shield_loss", 0.0),
+                ("approx_kl", 0.0),
+                ("clip_frac", 0.0),
+                ("policy_entropy", 1.0),
+                ("active_frac", 0.0),
+                ("p_riichi_legal", 0.0),
+                ("p_riichi_sum", 0.0),
+                ("n_riichi_legal", 0.0),
+                ("p_call_legal", 0.0),
+                ("p_call_sum", 0.0),
+                ("n_call_legal", 0.0),
+                ("beta_risk", 0.0),
+                ("beta_offense", 0.0),
+            ):
+                upd_metrics_acc[mk] = [mv]
+
+        jax.block_until_ready((params_pi, params_oracle))
         upd_wall_s = max(time.perf_counter() - t_upd_start, 1e-6)
         summary = {
             "update": float(upd),
             "in_warmup": float(in_warmup),
             "adv_rms": float(_unrep(rms_val)),
+            "adv_mean": float(np.asarray(jax.device_get(_unrep(adv_mean_arr)))),
+            "oracle_r2": float(np.asarray(jax.device_get(_unrep(oracle_r2_arr)))),
+            "oracle_r2_late": float(np.asarray(jax.device_get(_unrep(oracle_r2_late_arr)))),
+            "completed_round_frac": float(np.asarray(jax.device_get(_unrep(comp_frac_arr)))),
             "riichi_adv_gap": float(np.asarray(jax.device_get(_unrep(riichi_adv_gap_arr)))),
+            "riichi_pg": float(np.asarray(jax.device_get(_unrep(riichi_pg_arr)))),
             "ron_overflow": float(ron_overflow_host),
             "eff_policy_lr": float(eff_lr),
             "shield_lambda": float(shield_lam_val),
@@ -1103,6 +1535,9 @@ def train_rl_v6(
         }
         for mk, vals in upd_metrics_acc.items():
             summary[mk] = float(np.mean(vals)) if vals else 0.0
+        summary["finite_grads"] = 1.0 if all_finite else 0.0
+        if cfg.rnad.freeze_belief:
+            summary["belief_pred_mean"] = float(np.asarray(jax.device_get(_unrep(bel_pred_mean_arr))))
         # Exact weighted average across minibatches (avoids 0-dilution on sparse Riichi/Call states)
         sum_n_rii = float(np.sum(upd_metrics_acc.get("n_riichi_legal", [0.0])))
         sum_p_rii = float(np.sum(upd_metrics_acc.get("p_riichi_sum", [0.0])))
@@ -1168,6 +1603,7 @@ def train_rl_v6(
             heal_reasons_str = ", ".join(report.reasons)
             summary["healed"] = 1.0 if report.action_taken in ("rollback_and_halve_lr", "abort") else 0.0
             if report.action_taken in ("rollback_and_halve_lr", "abort"):
+                ora_replay.clear()
                 restored = healer.restore_latest()
                 if restored is not None:
                     params_pi = _rep(restored["params_pi"])
@@ -1183,7 +1619,7 @@ def train_rl_v6(
                     last_eff_lr = None
                 if report.action_taken == "abort":
                     aborted = True
-            elif report.healthy and ((upd + 1) % max(int(cfg.rnad.audit_interval), 1) == 0):
+            elif report.healthy and healer.is_snapshot_safe(summary) and ((upd + 1) % max(int(cfg.rnad.audit_interval), 1) == 0):
                 healer.save_checkpoint(
                     upd + 1,
                     {
@@ -1220,9 +1656,11 @@ def train_rl_v6(
                 heal_str = ""
             print(
                 f"[RL {phase_tag}] upd {upd + 1}/{cfg.num_updates} ({upd_wall_s:.1f}s, {summary['sps']:,.0f} sps) | "
-                f"ora_ce={summary.get('oracle_rank_ce', 0.0):.3f} bel_p={summary.get('belief_pred_mean', 0.0):.4f} "
-                f"ent={summary.get('policy_entropy', 0.0):.3f} kl={summary.get('approx_kl', 0.0):.4f} "
-                f"bc_kl={summary.get('bc_kl', 0.0):.4f} p_rii={summary.get('p_riichi_legal', 0.0):.3f}(n={int(summary.get('n_riichi_legal', 0.0))}) "
+                f"ora_ce={summary.get('oracle_rank_ce', 0.0):.3f} r2={summary.get('oracle_r2', 0.0):.3f}({summary.get('oracle_r2_late', 0.0):.2f}) "
+                f"adv_m={summary.get('adv_mean', 0.0):+.4f} ent={summary.get('policy_entropy', 0.0):.3f} "
+                f"kl={summary.get('approx_kl', 0.0):.4f} bc_kl={summary.get('bc_kl', 0.0):.4f} "
+                f"p_rii={summary.get('p_riichi_legal', 0.0):.3f}(n={int(summary.get('n_riichi_legal', 0.0))}) "
+                f"rii_pg={summary.get('riichi_pg', 0.0):+.4f} p_call={summary.get('p_call_legal', 0.0):.3f} "
                 f"b_r={summary.get('beta_risk', 0.0):.3f} b_o={summary.get('beta_offense', 0.0):.3f} | "
                 f"ETA={eta_s/60:.1f}m{heal_str}",
                 flush=True,

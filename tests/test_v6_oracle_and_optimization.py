@@ -261,7 +261,16 @@ def test_oracle_equivariance_with_opponent_tenpai_scalars():
         river_dim=8,
     )
     planes = jax.random.uniform(k1, (2, 53, 34), minval=0.0, maxval=1.0)
+    # Populate realistic integer thermometer hand counts across all 4 seats so _exact_shanten_4 exercises varied closed/open shanten
+    planes = planes.at[:, 0:4, :].set(0.0)
+    planes = planes.at[:, 0, [0, 1, 2, 4, 5, 6, 9, 10, 11, 18, 19, 31]].set(1.0)
+    planes = planes.at[1, 0, [20, 21, 27]].set(1.0)
+    planes = planes.at[:, 0:2, 31].set(1.0)
     ora_planes = jnp.zeros((2, 26, 34), dtype=jnp.float32)
+    # Opp 0 (13 concealed tiles), Opp 1 (10 tiles open hand), Opp 2 (13 tiles w/ dragons & triplet)
+    ora_planes = ora_planes.at[:, 0, [1, 3, 5, 9, 12, 15, 20, 22, 25, 27, 28, 29, 30]].set(1.0)
+    ora_planes = ora_planes.at[:, 4, [0, 1, 2, 13, 21, 22, 23, 32, 33]].set(1.0).at[:, 4:6, 13].set(1.0)
+    ora_planes = ora_planes.at[:, 8, [6, 7, 14, 15, 16, 23, 24, 25, 27, 31]].set(1.0).at[:, 8:11, 32].set(1.0)
     # Populate wall_planes (15..18), opp_waits (20..22), and opp_nf_waits (23..25) with non-trivial patterns
     ora_planes = ora_planes.at[:, 15:18, 2].set(1.0).at[:, 15:17, 11].set(1.0).at[:, 15:19, 31].set(1.0)
     ora_planes = ora_planes.at[:, 20, 2].set(1.0).at[:, 21, 11].set(1.0).at[:, 22, 31].set(1.0)
@@ -282,6 +291,13 @@ def test_oracle_equivariance_with_opponent_tenpai_scalars():
         current_player=cp,
         river_spatial_feat=river_feat,
     )
+    # Give zero-initialized spatial_resid_proj & delta_u_head non-trivial weights so equivariance is non-vacuous
+    ora_params["params"]["spatial_resid_proj"]["kernel"] = jax.random.normal(
+        k1, ora_params["params"]["spatial_resid_proj"]["kernel"].shape
+    )
+    ora_params["params"]["delta_u_head"]["kernel"] = jax.random.normal(
+        k2, ora_params["params"]["delta_u_head"]["kernel"].shape
+    )
     base_out = jax.device_get(
         ora_net.apply(
             ora_params,
@@ -296,6 +312,7 @@ def test_oracle_equivariance_with_opponent_tenpai_scalars():
     )
 
     max_err = 0.0
+    max_du_err = 0.0
     for sp, dp in SYMMETRY_PERMS_36:
         tile_map, _ = build_tile_and_action_perm_36(sp, dp)
         inv_tile = np.argsort(tile_map)
@@ -312,7 +329,13 @@ def test_oracle_equivariance_with_opponent_tenpai_scalars():
             )
         )
         max_err = max(max_err, float(np.max(np.abs(perm_out["probs_4x4"] - base_out["probs_4x4"]))))
+        max_du_err = max(
+            max_du_err,
+            float(np.max(np.abs(perm_out["delta_u_ego"] - base_out["delta_u_ego"]))),
+            float(np.max(np.abs(perm_out["delta_u_abs"] - base_out["delta_u_abs"]))),
+        )
     assert max_err < 1e-4, f"Oracle 36x equivariance error too high: {max_err}"
+    assert max_du_err < 1e-4, f"Oracle delta_u 36x equivariance error too high: {max_du_err}"
 
 
 def test_freeze_belief_preserves_phase0_weights_bit_for_bit():
@@ -618,3 +641,172 @@ def test_desync_hanchan_envs_spreads_rounds():
     assert not np.any(terms)
     assert len(set(zip(rounds, steps))) >= 5
     assert max(rounds) >= 1
+
+
+def test_lambda_inter_zero_eliminates_cross_round_and_vboot_bleed():
+    """Verify lambda_intra=1.0 & lambda_inter=0.0 isolates completed rounds from v_boot and future rounds."""
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(71), 3)
+    B, T = 2, 10
+    v_ora = log_sinkhorn_4x4(jax.random.normal(k1, (B, T, 4, 4)), num_iters=10)
+    v_boot = log_sinkhorn_4x4(jax.random.normal(k2, (B, 4, 4)), num_iters=10)
+    grp_ema = log_sinkhorn_4x4(jax.random.normal(k3, (B, T, 4, 4)), num_iters=10)
+    perm_mat = jnp.eye(4, dtype=jnp.float32)
+    term_4x4 = jnp.broadcast_to(perm_mat[None, None, :, :], (B, T, 4, 4))
+    dones = jnp.zeros((B, T), dtype=jnp.bool_)
+    round_ended = jnp.zeros((B, T), dtype=jnp.bool_).at[:, 3].set(True)
+
+    targets_clean = calculate_dual_rate_simplex_td_lambda(
+        v_ora, v_boot, grp_ema, term_4x4, dones, round_ended, lambda_intra=1.0, lambda_inter=0.0
+    )
+    v_boot_corrupt = jnp.broadcast_to(jnp.flip(perm_mat, axis=-1)[None, :, :], (B, 4, 4))
+    grp_corrupt = grp_ema.at[:, 4:].set(jnp.flip(perm_mat, axis=-1))
+    targets_corrupt = calculate_dual_rate_simplex_td_lambda(
+        v_ora, v_boot_corrupt, grp_corrupt, term_4x4, dones, round_ended, lambda_intra=1.0, lambda_inter=0.0
+    )
+    for t in range(4):
+        np.testing.assert_allclose(np.asarray(targets_clean[:, t]), np.asarray(grp_ema[:, 3]), atol=1e-7)
+        np.testing.assert_allclose(np.asarray(targets_corrupt[:, t]), np.asarray(grp_ema[:, 3]), atol=1e-7)
+
+
+def test_self_healing_is_snapshot_safe():
+    """Verify is_snapshot_safe blocks drifted Riichi/KL/entropy checkpoints from becoming rollback points."""
+    healer = SelfHealingManager(cfg=RNaDConfig(safe_snapshot_max_p_riichi=0.65, max_approx_kl=0.045, min_policy_entropy=0.35))
+    assert healer.is_snapshot_safe({"approx_kl": 0.005, "policy_entropy": 0.48, "p_riichi_legal": 0.50, "n_riichi_legal": 100.0})
+    assert not healer.is_snapshot_safe({"approx_kl": 0.005, "policy_entropy": 0.48, "p_riichi_legal": 0.72, "n_riichi_legal": 100.0})
+    assert not healer.is_snapshot_safe({"approx_kl": 0.030, "policy_entropy": 0.48, "p_riichi_legal": 0.45, "n_riichi_legal": 100.0})
+    assert not healer.is_snapshot_safe({"approx_kl": 0.005, "policy_entropy": 0.37, "p_riichi_legal": 0.45, "n_riichi_legal": 100.0})
+    # Rolling window breach should also block snapshot even if single step dipped to 0.60
+    healer.evaluate_probes({"approx_kl": 0.005, "policy_entropy": 0.50, "p_riichi_legal": 0.75, "n_riichi_legal": 200.0})
+    assert not healer.is_snapshot_safe({"approx_kl": 0.005, "policy_entropy": 0.50, "p_riichi_legal": 0.60, "n_riichi_legal": 50.0})
+
+
+def test_permanent_bc_anchor_pfsp_snapshots_and_phoenix_7d_pool():
+    """Verify outer_reset_steps=0 preserves BC anchor, snapshots PFSP, and logs R2/adv_mean/comp_frac."""
+    w_tables, is_pfsp, learn_mask = sample_meta_table_pool(
+        16, jax.random.PRNGKey(0), phoenix_7d_only=True, pfsp_frac=0.50
+    )
+    assert int(jnp.sum(is_pfsp)) == 8
+    np.testing.assert_allclose(
+        np.asarray(w_tables),
+        np.broadcast_to(np.asarray(W_PHOENIX_7D)[None, None, :], (16, 4, 4)),
+        atol=1e-6,
+    )
+    assert np.all(np.asarray(learn_mask)[:8])
+    assert np.all(np.asarray(learn_mask)[8:].sum(axis=1) == 1)
+
+    small_model = ModelConfig(num_blocks=1, channels=32, river_dim=8, attn_heads=4, global_hidden_dim=32)
+    small_belief = BeliefConfig(num_blocks=1, channels=32, river_dim=8, attn_heads=4, global_hidden_dim=32)
+    small_grp = GRPConfig(hidden_dim=32, num_layers=2)
+    small_oracle = OracleConfig(num_blocks=1, channels=32, attn_heads=4, global_hidden_dim=32)
+
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(83), 3)
+    p_init = init_policy_params(SovereignPolicyNet(config=small_model), k1)
+    b_init = _init_belief_params(BeliefNet(config=small_belief), k2)
+    g_init = GRPNet(config=small_grp).init(k3, jnp.zeros((2, GRP_FEATURE_DIM), dtype=jnp.float32))
+
+    rl_cfg = RLConfig(
+        round_mode="single",
+        model=small_model,
+        belief=small_belief,
+        grp=small_grp,
+        oracle=small_oracle,
+        rnad=RNaDConfig(
+            lambda_intra=1.0,
+            lambda_inter=0.0,
+            mask_unterminated_tail=True,
+            outer_reset_steps=0,
+            pfsp_snapshot_interval=2,
+            phoenix_7d_only=True,
+            pfsp_frac=0.50,
+            opp_temperature=0.5,
+            warmup_updates=1,
+            audit_interval=2,
+        ),
+        num_envs=4,
+        num_steps=32,
+        num_updates=5,
+        update_epochs=1,
+        minibatch_size=64,
+        seed=0,
+    )
+    res = train_rl_v6(
+        rl_cfg,
+        policy_params_init=p_init,
+        belief_params_init=b_init,
+        grp_params_init=g_init,
+        enable_self_healing=True,
+        multi_gpu=False,
+        verbose=False,
+    )
+    assert len(res.history) == 5
+    assert len(res.outer_snapshots) >= 2
+    for row in res.history:
+        assert np.isfinite(row["oracle_r2"])
+        assert np.isfinite(row["adv_mean"])
+        assert 0.0 <= row["completed_round_frac"] <= 1.0
+        assert np.isfinite(row["oracle_delta_u_loss"])
+
+
+def test_oracle_replay_buffer_and_riichi_pg_logging():
+    """Verify host-RAM Oracle replay buffer + decoupled updates + riichi_pg & oracle_r2_late logging."""
+    small_model = ModelConfig(num_blocks=1, channels=32, river_dim=8, attn_heads=4, global_hidden_dim=32)
+    small_belief = BeliefConfig(num_blocks=1, channels=32, river_dim=8, attn_heads=4, global_hidden_dim=32)
+    small_grp = GRPConfig(hidden_dim=32, num_layers=2)
+    small_oracle = OracleConfig(
+        num_blocks=1,
+        channels=32,
+        attn_heads=4,
+        global_hidden_dim=32,
+        tabular_hidden_dim=64,
+        head_hidden_dim=48,
+        replay_updates=3,
+        update_epochs=1,
+    )
+
+    k1, k2, k3 = jax.random.split(jax.random.PRNGKey(97), 3)
+    p_init = init_policy_params(SovereignPolicyNet(config=small_model), k1)
+    b_init = _init_belief_params(BeliefNet(config=small_belief), k2)
+    g_init = GRPNet(config=small_grp).init(k3, jnp.zeros((2, GRP_FEATURE_DIM), dtype=jnp.float32))
+
+    rl_cfg = RLConfig(
+        round_mode="single",
+        model=small_model,
+        belief=small_belief,
+        grp=small_grp,
+        oracle=small_oracle,
+        rnad=RNaDConfig(
+            freeze_belief=True,
+            warmup_updates=2,
+            outer_reset_steps=0,
+            pfsp_snapshot_interval=2,
+            phoenix_7d_only=True,
+            pfsp_frac=0.625,
+            opp_temperature=0.35,
+            audit_interval=2,
+        ),
+        num_envs=4,
+        num_steps=32,
+        num_updates=6,
+        update_epochs=1,
+        minibatch_size=64,
+        seed=0,
+    )
+    res = train_rl_v6(
+        rl_cfg,
+        policy_params_init=p_init,
+        belief_params_init=b_init,
+        grp_params_init=g_init,
+        enable_self_healing=True,
+        multi_gpu=False,
+        verbose=False,
+    )
+    assert len(res.history) == 6
+    for row in res.history:
+        assert np.isfinite(row["oracle_r2"])
+        assert np.isfinite(row["oracle_r2_late"])
+        assert np.isfinite(row["riichi_pg"])
+        assert np.isfinite(row["oracle_delta_u_loss"])
+        assert row["belief_loss"] == 0.0
+    # Warmup skips Policy updates while still training Oracle
+    assert res.history[0]["in_warmup"] == 1.0 and res.history[0]["ppo_loss"] == 0.0
+    assert res.history[2]["in_warmup"] == 0.0 and np.isfinite(res.history[2]["bc_kl"])

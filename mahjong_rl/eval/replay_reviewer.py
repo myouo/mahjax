@@ -577,34 +577,11 @@ def convert_tenhou_xml_to_mjai(xml_text: str) -> Tuple[List[Dict[str, Any]], Lis
     return events, names
 
 
-def load_replay_to_mjai(source: str | Path) -> Tuple[List[Dict[str, Any]], List[str]]:
-    """Load a replay from file path or Tenhou URL and return `(mjai_events, player_names)`."""
-    src_str = str(source).strip()
-    if src_str.startswith(("http://", "https://")):
-        if "maj-soul.com" in src_str or "mahjongsoul" in src_str:
-            raise ValueError(
-                "Mahjong Soul URLs require authenticated WebSocket decryption. "
-                "Please export the log as Tenhou JSON or MJAI JSONL (e.g. via Majsoul Plus / "
-                "雀魂牌谱屋 / mjai-reviewer) and pass the exported file path."
-            )
-        # Support Tenhou URL like https://tenhou.net/0/?log=2026010100gm-00a9-0000-...
-        parsed = urllib.parse.urlparse(src_str)
-        qs = urllib.parse.parse_qs(parsed.query)
-        log_id = qs.get("log", [""])[0]
-        if not log_id:
-            raise ValueError(f"Could not extract Tenhou `log=` id from URL: {src_str}")
-        fetch_url = f"https://tenhou.net/0/log/?{log_id}"
-        req = urllib.request.Request(fetch_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            text = resp.read().decode("utf-8")
-        return convert_tenhou_xml_to_mjai(text)
-
-    path = Path(src_str)
-    if not path.exists():
-        raise FileNotFoundError(f"Replay file not found: {path}")
-    raw = path.read_text(encoding="utf-8").strip()
+def load_replay_text_to_mjai(raw_text: str) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Parse replay text (Tenhou XML, Tenhou JSON, MJAI JSON list, or MJAI JSONL) into `(mjai_events, player_names)`."""
+    raw = raw_text.strip()
     if not raw:
-        raise ValueError(f"Empty replay file: {path}")
+        raise ValueError("Empty replay content.")
 
     # 1. Tenhou XML (.mjlog)
     if raw.startswith("<"):
@@ -634,6 +611,34 @@ def load_replay_to_mjai(source: str | Path) -> Tuple[List[Dict[str, Any]], List[
             names = [str(x) for x in ev["names"][:4]]
             break
     return events, names
+
+
+def load_replay_to_mjai(source: str | Path) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Load a replay from file path or Tenhou URL and return `(mjai_events, player_names)`."""
+    src_str = str(source).strip()
+    if src_str.startswith(("http://", "https://")):
+        if "maj-soul.com" in src_str or "mahjongsoul" in src_str:
+            raise ValueError(
+                "Mahjong Soul URLs require authenticated WebSocket decryption. "
+                "Please export the log as Tenhou JSON or MJAI JSONL (e.g. via Majsoul Plus / "
+                "雀魂牌谱屋 / mjai-reviewer) and pass the exported file path."
+            )
+        # Support Tenhou URL like https://tenhou.net/0/?log=2026010100gm-00a9-0000-...
+        parsed = urllib.parse.urlparse(src_str)
+        qs = urllib.parse.parse_qs(parsed.query)
+        log_id = qs.get("log", [""])[0]
+        if not log_id:
+            raise ValueError(f"Could not extract Tenhou `log=` id from URL: {src_str}")
+        fetch_url = f"https://tenhou.net/0/log/?{log_id}"
+        req = urllib.request.Request(fetch_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            text = resp.read().decode("utf-8")
+        return convert_tenhou_xml_to_mjai(text)
+
+    path = Path(src_str)
+    if not path.exists():
+        raise FileNotFoundError(f"Replay file not found: {path}")
+    return load_replay_text_to_mjai(path.read_text(encoding="utf-8"))
 
 
 # =============================================================================
@@ -820,9 +825,200 @@ def _build_eval_step_fn(
             legal_action_mask=legal_mask,
         )
         probs = masked_categorical_probs(logits, legal_mask)
-        return probs, du_ron_87, b_out["p_tenpai"]
+        return probs, du_ron_87, b_out["p_tenpai"], b_out["p_deal"]
 
     return eval_state
+
+
+build_eval_step_fn = _build_eval_step_fn
+
+
+def _tile_to_34(tid: int) -> int:
+    if tid == 34:
+        return 4
+    if tid == 35:
+        return 13
+    if tid == 36:
+        return 22
+    return int(tid)
+
+
+def serialize_p_deal(p_deal_3x34: np.ndarray, hand_tiles: Sequence[int]) -> Dict[str, List[float]]:
+    """Serialize calibrated per-opponent deal-in probabilities `(3, 34)` for hand tiles and risky >=1% tiles."""
+    in_hand = {_tile_to_34(int(t)) for t in hand_tiles}
+    out: Dict[str, List[float]] = {}
+    for t34 in range(34):
+        col = p_deal_3x34[:, t34]
+        if (t34 in in_hand) or (float(np.max(col)) >= 0.01):
+            out[str(t34)] = [round(float(col[0]), 4), round(float(col[1]), 4), round(float(col[2]), 4)]
+    return out
+
+
+def classify_event_kind(action: int) -> str:
+    """Map MahJax action id to frontend `event_kind`."""
+    a = int(action)
+    if is_discard_action(a):
+        return "discard"
+    if a == Action.RIICHI:
+        return "riichi"
+    if a in (Action.TSUMO, Action.RON):
+        return "win"
+    if a == Action.KYUUSHU:
+        return "abort"
+    if a == Action.PASS:
+        return "pass"
+    return "call"
+
+
+def snapshot_frame(
+    ui_rules: Any,
+    st: Any,
+    *,
+    idx: int,
+    round_idx: int,
+    ply: int,
+    step_in_round: int,
+    round_label: str,
+    turn: int,
+    seat: int,
+    event_kind: str,
+    river_origins: Sequence[Sequence[int]],
+    chosen_action: int = -1,
+    is_decision: bool = False,
+    ai_eval: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None,
+    ura_dora: Optional[List[int]] = None,
+    round_result: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Capture a complete table snapshot frame reusable by replay review and What-If branching."""
+    mask_np = np.asarray(st.legal_action_mask, dtype=bool)
+    legal_idx = np.flatnonzero(mask_np)
+    ld = int(st.round_state.last_draw)
+    tgt = int(st.round_state.target)
+    is_disc = chosen_action >= 0 and is_discard_action(chosen_action)
+    discard_tile = (
+        chosen_action if (0 <= chosen_action <= 36) else (ld if chosen_action == Action.TSUMOGIRI else -1)
+    )
+    is_tsumogiri = chosen_action == Action.TSUMOGIRI
+
+    hands = [ui_rules.hand_tiles(st, p) for p in range(4)]
+    rivers: List[List[List[int]]] = []
+    for p in range(4):
+        raw_river = ui_rules.river(st, p)
+        origins_p = river_origins[p] if p < len(river_origins) else []
+        r_list: List[List[int]] = []
+        for r_idx, r in enumerate(raw_river):
+            orig = int(origins_p[r_idx]) if r_idx < len(origins_p) else -1
+            r_list.append([int(r["tile"]), int(r["riichi"]), int(r["called"]), int(r["tsumogiri"]), orig])
+        rivers.append(r_list)
+
+    melds = [
+        [
+            {
+                "kind": m["kind"],
+                "tiles": [int(t) for t in m["tiles"]],
+                "called": m["called"],
+                "from": m["from"],
+            }
+            for m in ui_rules.melds(st, p)
+        ]
+        for p in range(4)
+    ]
+
+    dora_vis = [int(x) for x in np.asarray(st.round_state.dora_indicators, dtype=np.int32).tolist() if int(x) >= 0]
+    wall_rem = ui_rules.remaining_draws(st)
+
+    has_ai = ai_eval is not None
+    human_action_str = format_action_cn(chosen_action, last_draw=ld, target=tgt) if chosen_action >= 0 else ""
+    if ai_eval is not None and len(legal_idx) > 0:
+        probs, du_ron, p_tenpai, p_deal = ai_eval
+        order = legal_idx[np.argsort(-probs[legal_idx])]
+        best_act = int(order[0])
+        best_p = float(probs[best_act])
+        best_str = format_action_cn(best_act, last_draw=ld, target=tgt)
+        if chosen_action >= 0:
+            human_p = float(probs[chosen_action])
+            ratio = float(np.clip(human_p / max(best_p, 1e-8), 0.0, 1.0))
+            matched_top1 = chosen_action == best_act
+            is_blunder = human_p < 0.05 and best_p >= 0.50
+            du_ron_human = float(du_ron[chosen_action])
+        else:
+            human_p = 0.0
+            ratio = 1.0
+            matched_top1 = True
+            is_blunder = False
+            du_ron_human = 0.0
+        cands = [
+            {
+                "a": int(a),
+                "label": format_action_cn(int(a), last_draw=ld, target=tgt),
+                "prob": round(float(probs[int(a)]), 4),
+                "du_ron": round(float(du_ron[int(a)]), 4),
+            }
+            for a in order
+        ]
+        du_ron_best = float(du_ron[best_act])
+        p_tenpai_list = [round(float(x), 3) for x in p_tenpai.tolist()]
+        p_deal_dict = serialize_p_deal(p_deal, hands[seat] if 0 <= seat < 4 else [])
+    else:
+        best_act = -1
+        best_p = 0.0
+        best_str = ""
+        human_p = 0.0
+        ratio = 1.0
+        matched_top1 = True
+        is_blunder = False
+        cands = []
+        du_ron_human = 0.0
+        du_ron_best = 0.0
+        p_tenpai_list = [0.0, 0.0, 0.0]
+        p_deal_dict = {}
+
+    return {
+        "idx": int(idx),
+        "round_idx": int(round_idx),
+        "ply": int(ply),
+        "step_in_round": int(step_in_round),
+        "round_label": round_label,
+        "dealer": int(st.round_state.dealer),
+        "honba": int(st.round_state.honba),
+        "kyotaku": int(st.round_state.kyotaku),
+        "wall_rem": int(wall_rem),
+        "dora": dora_vis,
+        "ura_dora": list(ura_dora) if ura_dora is not None else [],
+        "turn": int(turn),
+        "seat": int(seat),
+        "event_kind": event_kind,
+        "is_decision": bool(is_decision),
+        "has_ai": bool(has_ai),
+        "is_discard": bool(is_disc),
+        "discard_tile": int(discard_tile),
+        "is_tsumogiri": bool(is_tsumogiri),
+        "scores": ui_rules.scores(st),
+        "riichi": [bool(st.players.riichi[p]) or bool(st.players.riichi_declared[p]) for p in range(4)],
+        "riichi_declared": [bool(st.players.riichi_declared[p]) for p in range(4)],
+        "hands": hands,
+        "rivers": rivers,
+        "melds": melds,
+        "last_draw": ld,
+        "target": tgt,
+        "last_discard": ui_rules.last_discard(st),
+        "legal_actions": [int(a) for a in legal_idx.tolist()],
+        "human_action": int(chosen_action),
+        "human_action_str": human_action_str,
+        "human_prob": round(human_p, 4),
+        "best_action": int(best_act),
+        "best_action_str": best_str,
+        "best_prob": round(best_p, 4),
+        "prob_ratio": round(ratio, 4),
+        "matched_top1": bool(matched_top1),
+        "is_blunder": bool(is_blunder),
+        "candidates": cands,
+        "delta_u_ron_human": round(du_ron_human, 4),
+        "delta_u_ron_best": round(du_ron_best, 4),
+        "p_tenpai": p_tenpai_list,
+        "p_deal": p_deal_dict,
+        "round_result": round_result,
+    }
 
 
 def _summarize_decisions(decisions: List[DecisionReview], top_k_blunders: int = 10) -> Dict[str, Any]:
@@ -891,6 +1087,7 @@ def review_replay(
     custom_rule_points: Optional[Sequence[float]] = None,
     target_seat: Optional[int] = None,
     top_k_blunders: int = 10,
+    events_override: Optional[Tuple[List[Dict[str, Any]], List[str]]] = None,
 ) -> Dict[str, Any]:
     """Review a full Tenhou / Mahjong Soul / MJAI replay with Sovereign-Mahjong V6."""
     if custom_rule_points is not None:
@@ -903,12 +1100,16 @@ def review_replay(
         w_rule = REVIEW_RULE_MAP[key]
         rule_name = key
 
-    events, player_names = load_replay_to_mjai(replay_source)
+    if events_override is not None:
+        events, player_names = events_override
+    else:
+        events, player_names = load_replay_to_mjai(replay_source)
     events_jsonl = "\n".join(json.dumps(ev, ensure_ascii=False) for ev in events)
     parsed_rounds = parse_mjai_game_to_rounds(events_jsonl, max_events_per_round=160)
     if not parsed_rounds:
         raise ValueError("No valid kyokus could be parsed from replay.")
 
+    from mahjax.ui import view as ui_view
     from mahjax.ui.rules import Rules
     ui_rules = Rules("red_4p")
     env = mahjax.make("red_4p", round_mode="half", observe_type="dict", round_end="confirm")
@@ -927,6 +1128,7 @@ def review_replay(
 
     decisions_by_seat: Dict[int, List[DecisionReview]] = {0: [], 1: [], 2: [], 3: []}
     frames: List[Dict[str, Any]] = []
+    rounds_meta: List[Dict[str, Any]] = []
     desynced_rounds = 0
 
     for r_i, pr in enumerate(parsed_rounds):
@@ -940,13 +1142,24 @@ def review_replay(
             round_limit=7,
         )
         r_label = format_round_label(int(pr.round_num), int(pr.honba))
+        score_start = ui_rules.scores(st)
+        first_frame_idx = len(frames)
         cursor = 0
         n_ev = int(pr.n_events)
         turn_counter = [0, 0, 0, 0]
+        round_actions: List[int] = []
+        river_origins: List[List[int]] = [[], [], [], []]
+        round_wins: List[Dict[str, Any]] = []
+        blunder_counts = [0, 0, 0, 0]
+        abort_reason: Optional[str] = None
+        abort_seat: Optional[int] = None
+        end_state: Any = st
+        desynced_this_round = False
+        ply = 0
 
-        for _ in range(220):
-            round_over = bool(st.round_state.terminated_round) or bool(st.terminated) or bool(st.truncated)
-            if round_over:
+        for step_in_round in range(220):
+            if ui_rules.is_round_over(st) or bool(st.terminated) or bool(st.truncated):
+                end_state = st
                 break
             cp = int(st.current_player)
             mask_np = np.asarray(st.legal_action_mask, dtype=bool)
@@ -980,18 +1193,27 @@ def review_replay(
                 chosen_action = int(Action.PASS)
             else:
                 desynced_rounds += 1
+                desynced_this_round = True
+                end_state = st
                 break
 
             is_disc = is_discard_action(chosen_action)
             if is_disc:
                 turn_counter[cp] += 1
 
-            # Evaluate non-forced decisions for requested seat(s)
-            if num_legal >= 2 and chosen_action != Action.DUMMY and (target_seat is None or cp == target_seat):
-                probs_j, du_ron_j, p_tenpai_j = eval_fn(st)
+            event_kind = classify_event_kind(chosen_action)
+            is_decision = (num_legal >= 2) and (chosen_action != Action.DUMMY)
+            should_eval = is_decision and (target_seat is None or cp == target_seat)
+            emit_frame = (event_kind in ("discard", "riichi", "call", "win", "abort")) or should_eval
+
+            ai_eval: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None
+            if should_eval:
+                probs_j, du_ron_j, p_tenpai_j, p_deal_j = eval_fn(st)
                 probs = np.asarray(jax.device_get(probs_j), dtype=np.float64)
                 du_ron = np.asarray(jax.device_get(du_ron_j), dtype=np.float64)
                 p_tenpai = np.asarray(jax.device_get(p_tenpai_j), dtype=np.float64)
+                p_deal = np.asarray(jax.device_get(p_deal_j), dtype=np.float64)
+                ai_eval = (probs, du_ron, p_tenpai, p_deal)
 
                 legal_idx = np.flatnonzero(mask_np)
                 order = legal_idx[np.argsort(-probs[legal_idx])]
@@ -1000,6 +1222,9 @@ def review_replay(
                 human_p = float(probs[chosen_action])
                 ratio = float(np.clip(human_p / max(best_p, 1e-8), 0.0, 1.0))
                 nll = float(-math.log(max(human_p, 1e-7)))
+                is_blunder = (human_p < 0.05 and best_p >= 0.50)
+                if is_blunder:
+                    blunder_counts[cp] += 1
 
                 ld = int(st.round_state.last_draw)
                 tgt = int(st.round_state.target)
@@ -1025,7 +1250,7 @@ def review_replay(
                         matched_top1=(chosen_action == best_act),
                         matched_top2=(chosen_action in order[:2]),
                         matched_top3=(chosen_action in order[:3]),
-                        is_blunder=(human_p < 0.05 and best_p >= 0.50),
+                        is_blunder=is_blunder,
                         top3=top3,
                         delta_u_ron_human=float(du_ron[chosen_action]),
                         delta_u_ron_best=float(du_ron[best_act]),
@@ -1033,62 +1258,136 @@ def review_replay(
                     )
                 )
 
-                # Capture compact table snapshot for interactive NAGA/KillerDucky panel
-                dora_raw = np.asarray(st.round_state.dora_indicators, dtype=np.int32).tolist()
-                dora_vis = [int(x) for x in dora_raw if int(x) >= 0]
-                wall_rem = max(int(st.round_state.next_deck_ix) - int(st.round_state.last_deck_ix) + 1, 0)
-                cands = [
-                    {
-                        "a": int(a),
-                        "label": format_action_cn(int(a), last_draw=ld, target=tgt),
-                        "prob": round(float(probs[int(a)]), 4),
-                        "du_ron": round(float(du_ron[int(a)]), 4),
-                    }
-                    for a in order[:16]
-                ]
-                frames.append(
-                    {
-                        "idx": len(frames),
-                        "round_idx": r_i,
-                        "round_label": r_label,
-                        "dealer": int(st.round_state.dealer),
-                        "honba": int(st.round_state.honba),
-                        "kyotaku": int(st.round_state.kyotaku),
-                        "wall_rem": wall_rem,
-                        "dora": dora_vis,
-                        "turn": max(turn_counter[cp], 1),
-                        "seat": cp,
-                        "scores": ui_rules.scores(st),
-                        "riichi": [bool(st.players.riichi[p]) or bool(st.players.riichi_declared[p]) for p in range(4)],
-                        "hands": [ui_rules.hand_tiles(st, p) for p in range(4)],
-                        "rivers": [
-                            [[int(r["tile"]), int(r["riichi"]), int(r["called"]), int(r["tsumogiri"])] for r in ui_rules.river(st, p)]
-                            for p in range(4)
-                        ],
-                        "melds": [
-                            [{"kind": m["kind"], "tiles": [int(t) for t in m["tiles"]]} for m in ui_rules.melds(st, p)]
-                            for p in range(4)
-                        ],
-                        "last_draw": ld,
-                        "target": tgt,
-                        "is_discard": is_disc,
-                        "human_action": chosen_action,
-                        "human_action_str": format_action_cn(chosen_action, last_draw=ld, target=tgt),
-                        "human_prob": round(human_p, 4),
-                        "best_action": best_act,
-                        "best_action_str": format_action_cn(best_act, last_draw=ld, target=tgt),
-                        "best_prob": round(best_p, 4),
-                        "prob_ratio": round(ratio, 4),
-                        "matched_top1": (chosen_action == best_act),
-                        "is_blunder": (human_p < 0.05 and best_p >= 0.50),
-                        "candidates": cands,
-                        "delta_u_ron_human": round(float(du_ron[chosen_action]), 4),
-                        "delta_u_ron_best": round(float(du_ron[best_act]), 4),
-                        "p_tenpai": [round(float(x), 3) for x in p_tenpai.tolist()],
-                    }
+            if emit_frame:
+                frame = snapshot_frame(
+                    ui_rules,
+                    st,
+                    idx=len(frames),
+                    round_idx=r_i,
+                    ply=ply,
+                    step_in_round=step_in_round,
+                    round_label=r_label,
+                    turn=max(turn_counter[cp], 1),
+                    seat=cp,
+                    event_kind=event_kind,
+                    river_origins=river_origins,
+                    chosen_action=chosen_action,
+                    is_decision=is_decision,
+                    ai_eval=ai_eval,
                 )
+                frames.append(frame)
+                if event_kind == "discard":
+                    river_origins[cp].append(frame["idx"])
+                ply += 1
 
-            st = step_fn(st, jnp.int32(chosen_action), dummy_key)
+            round_actions.append(int(chosen_action))
+            if chosen_action == Action.KYUUSHU:
+                abort_reason, abort_seat = ui_view.abortive_cause(ui_rules, st)
+                end_state = st
+                break
+
+            post_st = step_fn(st, jnp.int32(chosen_action), dummy_key)
+            if chosen_action in (Action.TSUMO, Action.RON):
+                round_wins.append(ui_view.build_win(ui_rules, st, post_st, cp, chosen_action == Action.RON))
+            st = post_st
+            end_state = st
+
+        # Build round-end summary and emit final round_end frame
+        if desynced_this_round and abort_reason is None and not round_wins:
+            round_result: Dict[str, Any] = {
+                "type": "desync",
+                "reason": "desync",
+                "abortSeat": None,
+                "round": {"index": int(pr.round_num), "honba": int(pr.honba), "kyotaku": int(pr.kyotaku)},
+                "winners": [],
+                "tenpai": None,
+                "nagashiMangan": None,
+                "deltas": [0, 0, 0, 0],
+                "scores": ui_rules.scores(end_state),
+                "gameOver": False,
+                "final": None,
+            }
+        elif abort_reason is not None:
+            round_result = ui_view.build_round_result(
+                ui_rules,
+                type="abortive",
+                reason=abort_reason,
+                state=end_state,
+                winners=[],
+                score_start=score_start,
+                game_over=False,
+                abort_seat=abort_seat,
+            )
+        elif round_wins:
+            r_type = "ron" if any(w.get("from") is not None for w in round_wins) else "tsumo"
+            round_result = ui_view.build_round_result(
+                ui_rules,
+                type=r_type,
+                reason=None,
+                state=end_state,
+                winners=round_wins,
+                score_start=score_start,
+                game_over=False,
+                abort_seat=None,
+            )
+        else:
+            round_result = ui_view.build_round_result(
+                ui_rules,
+                type="draw",
+                reason=None,
+                state=end_state,
+                winners=[],
+                score_start=score_start,
+                game_over=False,
+                abort_seat=None,
+            )
+
+        ura_dora: List[int] = []
+        for w in round_result.get("winners") or []:
+            if w.get("uraDora"):
+                ura_dora = [int(x) for x in w["uraDora"]]
+                break
+
+        end_frame = snapshot_frame(
+            ui_rules,
+            end_state,
+            idx=len(frames),
+            round_idx=r_i,
+            ply=ply,
+            step_in_round=len(round_actions),
+            round_label=r_label,
+            turn=max(max(turn_counter), 1),
+            seat=int(end_state.current_player),
+            event_kind="round_end",
+            river_origins=river_origins,
+            chosen_action=-1,
+            is_decision=False,
+            ai_eval=None,
+            ura_dora=ura_dora,
+            round_result=round_result,
+        )
+        frames.append(end_frame)
+        last_frame_idx = end_frame["idx"]
+
+        rounds_meta.append(
+            {
+                "round_idx": r_i,
+                "round_num": int(pr.round_num),
+                "round_label": r_label,
+                "dealer": int(pr.dealer),
+                "honba": int(pr.honba),
+                "kyotaku": int(pr.kyotaku),
+                "init_scores": score_start,
+                "end_scores": round_result["scores"],
+                "deltas": round_result["deltas"],
+                "first_frame_idx": first_frame_idx,
+                "last_frame_idx": last_frame_idx,
+                "blunder_counts": blunder_counts,
+                "result": round_result,
+                "deck": [int(x) for x in np.asarray(pr.deck, dtype=np.int32).tolist()],
+                "actions": round_actions,
+            }
+        )
 
     seats_report: Dict[str, Any] = {}
     all_decisions: List[DecisionReview] = []
@@ -1103,13 +1402,16 @@ def review_replay(
         }
 
     return {
+        "schema_version": 2,
         "replay_source": str(replay_source),
         "policy_source": models.get("policy_source", ""),
         "rule": rule_name,
+        "player_names": player_names,
         "rounds_total": len(parsed_rounds),
         "rounds_desynced": desynced_rounds,
         "overall": _summarize_decisions(all_decisions, top_k_blunders=top_k_blunders),
         "seats": seats_report,
+        "rounds": rounds_meta,
         "frames": frames,
     }
 

@@ -114,24 +114,38 @@ def make_homogeneous_table(w: jnp.ndarray) -> jnp.ndarray:
 def sample_meta_table_pool(
     num_envs: int,
     rng_key: jax.Array,
+    *,
+    phoenix_7d_only: bool = False,
+    pfsp_frac: float = 0.35,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Allocate the V6 Tri-Regime Meta-Game Table Pool across `num_envs` parallel tables.
+    """Allocate the V6 Meta-Game Table Pool across `num_envs` parallel tables.
 
-    Pool allocation (matching Round 20 & Round 26 spec):
-    - Block A (50% Homogeneous Self-Play, all 4 seats learning):
-        * 25% Phoenix 7d (core equilibrium anchor)
-        * 15% Phoenix 10d (extreme avoid-4th vertex)
-        * 10% M-League (top-seeking vertex)
-    - Block B (35% PFSP Historical Snapshot League, seat 0 learning vs seats 1..3 frozen opp):
-        * Distributed proportionally across Phoenix 7d / 10d / M-League
-    - Block C (15% Extreme Cross-Dan Heterogeneous Tables, all 4 seats learning):
-        * Each of the 4 seats draws an independent rule from `RULE_CORRIDOR_BANK`
+    When `phoenix_7d_only=True`:
+    - All tables use `W_PHOENIX_7D`, split between homogeneous self-play (all 4 seats learning)
+      and 1v3 PFSP tables (`pfsp_frac` fraction, learning seat rotated evenly across 0..3).
+
+    When `phoenix_7d_only=False` (Tri-Regime Meta-Game Pool):
+    - Block A (50% Homogeneous Self-Play, all 4 seats learning): 25% 7d / 15% 10d / 10% M-League
+    - Block B (35% PFSP Historical Snapshot League, rotated single learning seat)
+    - Block C (15% Extreme Cross-Dan Heterogeneous Tables, all 4 seats learning)
 
     Returns:
         w_tables: `(num_envs, 4, 4)` float32 normalized utility matrices (absolute seats 0..3)
-        is_pfsp_env: `(num_envs,)` bool, True for Block B PFSP tables
+        is_pfsp_env: `(num_envs,)` bool, True for PFSP tables
         learning_seat_mask: `(num_envs, 4)` bool, True for seats controlled by active `params_pi`
     """
+    if phoenix_7d_only:
+        n_pfsp = min(max(0, int(round(num_envs * float(pfsp_frac)))), max(num_envs - 1, 0))
+        n_hom = num_envs - n_pfsp
+        w_tables = jnp.broadcast_to(make_homogeneous_table(W_PHOENIX_7D)[None, ...], (num_envs, 4, 4))
+        env_ids = jnp.arange(num_envs, dtype=jnp.int32)
+        is_pfsp_env = env_ids >= n_hom
+        pfsp_seat_ids = jnp.mod(jnp.maximum(env_ids - n_hom, 0), 4)
+        pfsp_seats = jax.nn.one_hot(pfsp_seat_ids, 4, dtype=jnp.bool_)
+        all_seats = jnp.ones((4,), dtype=jnp.bool_)
+        learning_seat_mask = jnp.where(is_pfsp_env[:, None], pfsp_seats, all_seats[None, :])
+        return w_tables, is_pfsp_env, learning_seat_mask
+
     n_hom = max(1, int(round(num_envs * 0.50)))
     n_pfsp = int(round(num_envs * 0.35))
     n_het = max(0, num_envs - n_hom - n_pfsp)

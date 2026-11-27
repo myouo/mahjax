@@ -24,7 +24,6 @@ function calcNormalShanten(c: Int8Array, numMelds: number): number {
   const maxGroups = 4 - numMelds;
 
   function dfs(i: number, melds: number, taatsu: number, pair: number): void {
-    // Lower bound prune
     const rem = maxGroups - melds;
     const effTaatsu = taatsu > rem ? rem : taatsu;
     const cur = 8 - (melds + numMelds) * 2 - effTaatsu - pair;
@@ -34,13 +33,11 @@ function calcNormalShanten(c: Int8Array, numMelds: number): number {
     while (i < 34 && c[i] === 0) i++;
     if (i >= 34) return;
 
-    // 1. Triplet (刻子)
     if (c[i] >= 3 && melds < maxGroups) {
       c[i] -= 3;
       dfs(i, melds + 1, taatsu, pair);
       c[i] += 3;
     }
-    // 2. Sequence (顺子)
     if (i < 27 && i % 9 <= 6 && c[i] >= 1 && c[i + 1] >= 1 && c[i + 2] >= 1 && melds < maxGroups) {
       c[i]--;
       c[i + 1]--;
@@ -50,19 +47,16 @@ function calcNormalShanten(c: Int8Array, numMelds: number): number {
       c[i + 1]++;
       c[i + 2]++;
     }
-    // 3. Pair (雀头)
     if (c[i] >= 2 && pair === 0) {
       c[i] -= 2;
       dfs(i, melds, taatsu, 1);
       c[i] += 2;
     }
-    // 4. Taatsu: pair-as-taatsu
     if (c[i] >= 2 && melds + taatsu < maxGroups) {
       c[i] -= 2;
       dfs(i, melds, taatsu + 1, pair);
       c[i] += 2;
     }
-    // 5. Taatsu: ryanmen / penchan (i, i+1)
     if (i < 27 && i % 9 <= 7 && c[i] >= 1 && c[i + 1] >= 1 && melds + taatsu < maxGroups) {
       c[i]--;
       c[i + 1]--;
@@ -70,7 +64,6 @@ function calcNormalShanten(c: Int8Array, numMelds: number): number {
       c[i]++;
       c[i + 1]++;
     }
-    // 6. Taatsu: kanchan (i, i+2)
     if (i < 27 && i % 9 <= 6 && c[i] >= 1 && c[i + 2] >= 1 && melds + taatsu < maxGroups) {
       c[i]--;
       c[i + 2]--;
@@ -78,7 +71,6 @@ function calcNormalShanten(c: Int8Array, numMelds: number): number {
       c[i]++;
       c[i + 2]++;
     }
-    // 7. Skip isolated tile
     dfs(i + 1, melds, taatsu, pair);
   }
 
@@ -108,7 +100,6 @@ function calcKokushiShanten(c: Int8Array): number {
   return 13 - kinds - hasPair;
 }
 
-/** Calculate minimum shanten (-1 = agari, 0 = tenpai, 1 = iishanten, ...). */
 export function calcShanten(tiles: number[], numMelds: number): number {
   const c = tilesToCounts34(tiles);
   let best = calcNormalShanten(c, numMelds);
@@ -118,13 +109,18 @@ export function calcShanten(tiles: number[], numMelds: number): number {
   return best;
 }
 
+export interface WaitDetail {
+  tile34: number;
+  rem: number;
+}
+
 export interface DiscardUkeire {
   shantenAfter: number;
   ukeireCount: number;
   waitTiles: number[];
+  waitDetails: WaitDetail[];
 }
 
-/** Compute shanten and live ukeire (remaining tiles out of 4 minus visible) after discarding `discardTid`. */
 export function calcDiscardUkeire(
   handTiles: number[],
   discardTid: number,
@@ -134,7 +130,7 @@ export function calcDiscardUkeire(
   const c = tilesToCounts34(handTiles);
   const d34 = toTile34(discardTid);
   if (d34 < 0 || d34 >= 34 || c[d34] <= 0) {
-    return { shantenAfter: 8, ukeireCount: 0, waitTiles: [] };
+    return { shantenAfter: 8, ukeireCount: 0, waitTiles: [], waitDetails: [] };
   }
   c[d34]--;
   let baseShanten = calcNormalShanten(c, numMelds);
@@ -144,9 +140,10 @@ export function calcDiscardUkeire(
 
   let total = 0;
   const waits: number[] = [];
+  const waitDetails: WaitDetail[] = [];
   for (let t = 0; t < 34; t++) {
-    const rem = 4 - visibleCounts[t];
-    if (rem <= 0 || c[t] >= 4) continue;
+    const rem = Math.max(0, 4 - visibleCounts[t]);
+    if (c[t] >= 4) continue;
     c[t]++;
     let s = calcNormalShanten(c, numMelds);
     if (numMelds === 0) {
@@ -156,9 +153,39 @@ export function calcDiscardUkeire(
     if (s < baseShanten) {
       total += rem;
       waits.push(t);
+      waitDetails.push({ tile34: t, rem });
     }
   }
-  return { shantenAfter: baseShanten, ukeireCount: total, waitTiles: waits };
+  return { shantenAfter: baseShanten, ukeireCount: total, waitTiles: waits, waitDetails };
+}
+
+export function calcTenpaiWaits(
+  handTiles: number[],
+  numMelds: number,
+  visibleCounts: Int8Array
+): { shanten: number; waitDetails: WaitDetail[]; totalRem: number } {
+  const c = tilesToCounts34(handTiles);
+  let baseShanten = calcNormalShanten(c, numMelds);
+  if (numMelds === 0) {
+    baseShanten = Math.min(baseShanten, calcChiitoiShanten(c), calcKokushiShanten(c));
+  }
+  const waitDetails: WaitDetail[] = [];
+  let totalRem = 0;
+  for (let t = 0; t < 34; t++) {
+    if (c[t] >= 4) continue;
+    c[t]++;
+    let s = calcNormalShanten(c, numMelds);
+    if (numMelds === 0) {
+      s = Math.min(s, calcChiitoiShanten(c), calcKokushiShanten(c));
+    }
+    c[t]--;
+    if (s < baseShanten) {
+      const rem = Math.max(0, 4 - visibleCounts[t]);
+      totalRem += rem;
+      waitDetails.push({ tile34: t, rem });
+    }
+  }
+  return { shanten: baseShanten, waitDetails, totalRem };
 }
 
 export function formatShantenCn(s: number): string {

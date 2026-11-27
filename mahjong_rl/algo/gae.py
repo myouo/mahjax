@@ -32,14 +32,16 @@ def calculate_dual_rate_simplex_td_lambda(
     dones: jnp.ndarray,
     round_ended: jnp.ndarray,
     lambda_intra: float = 1.0,
-    lambda_inter: float = 0.70,
+    lambda_inter: float = 0.0,
 ) -> jnp.ndarray:
     """Birkhoff-closed Dual-Rate Simplex TD(lambda) targets `(B, T, 4, 4)`.
 
     Preserves exact Birkhoff polytope closure (`row_sum == 1`, `col_sum == 1`) at every step
     via convex combinations of doubly-stochastic matrices:
     - If `done[b, t]`: `target = terminal_rank_4x4[b, t]` (exact 1-hot permutation, zero cross-episode leak!)
-    - Else if `round_ended[b, t]`: `target = (1 - lambda_inter) * GRP_EMA(s_{t+1}) + lambda_inter * next_target`
+    - Else if `round_ended[b, t]`:
+      * when `lambda_inter <= 0.0` (default): `target = GRP_EMA(s_{t+1})` (zero cross-round bleed!)
+      * otherwise: `target = (1 - lambda_inter) * GRP_EMA(s_{t+1}) + lambda_inter * next_target`
     - Else (intra-round):
       * when `lambda_intra >= 1.0` (default): `target = next_target` (exact round-horizon return, zero intra-round Oracle bootstrapping)
       * otherwise: `target = (1 - lambda_intra) * V_oracle(s_{t+1}) + lambda_intra * next_target`
@@ -52,7 +54,7 @@ def calculate_dual_rate_simplex_td_lambda(
         dones: `(B, T)` bool, True on the LAST step of a hanchan.
         round_ended: `(B, T)` bool, True when step `t` ended a hand/round.
         lambda_intra: Intra-round TD(lambda) decay (default `1.0`).
-        lambda_inter: Cross-round TD(lambda) blend with `GRP_EMA` (default `0.70`).
+        lambda_inter: Cross-round TD(lambda) blend with `GRP_EMA` (default `0.0`).
 
     Returns:
         targets_4x4: `(B, T, 4, 4)` float32 doubly-stochastic TD targets.
@@ -74,7 +76,7 @@ def calculate_dual_rate_simplex_td_lambda(
         def scan_fn(next_target, inputs):
             v_next, grp_next, term_mat, is_done, is_rend = inputs
             intra_t = next_target if lam_in >= 1.0 else (1.0 - lam_in) * v_next + lam_in * next_target
-            inter_t = (1.0 - lam_out) * grp_next + lam_out * next_target
+            inter_t = grp_next if lam_out <= 0.0 else (1.0 - lam_out) * grp_next + lam_out * next_target
             target_t = jnp.where(is_done, term_mat, jnp.where(is_rend, inter_t, intra_t))
             return target_t, target_t
 

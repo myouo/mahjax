@@ -220,12 +220,13 @@ def compute_policy_loss_v6(
     shield_per_step = jnp.sum(jnp.where(out_of_support, pi_probs * penalty_weight, 0.0), axis=-1)
     shield_loss = jnp.asarray(shield_lambda, dtype=jnp.float32) * masked_mean(shield_per_step, active_mask)
 
-    total_loss = ppo_loss + rnad_loss + shield_loss
+    entropy = masked_mean(masked_entropy(logits, mask), active_mask)
+    ent_bonus = -float(cfg.entropy_coef) * entropy
+    total_loss = ppo_loss + rnad_loss + shield_loss + ent_bonus
 
     # Diagnostics (strictly over active_mask)
     approx_kl = masked_mean((ratio - 1.0) - log_ratio, active_mask)
     clip_frac = masked_mean((jnp.abs(ratio - 1.0) > float(cfg.clip_eps)).astype(jnp.float32), active_mask)
-    entropy = masked_mean(masked_entropy(logits, mask), active_mask)
 
     # Behavioral anchor & Riichi/Call tendency probes (zero extra forward passes)
     log_bc = masked_categorical_log_probs(bc_logits, mask)
@@ -269,12 +270,27 @@ def compute_oracle_loss_v6(
     round_score_delta_ego: Optional[jnp.ndarray] = None,  # (N, 4) float32
     aux_valid: Optional[jnp.ndarray] = None,          # (N,) bool
     cfg: OracleConfig = OracleConfig(),
+    delta_u_target_ego: Optional[jnp.ndarray] = None,     # (N, 4) float32
+    valid_mask: Optional[jnp.ndarray] = None,             # (N,) bool
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    """4-seat Birkhoff placement cross-entropy + Dual-Horizon auxiliary supervision."""
+    """4-seat Birkhoff placement CE + direct ego-weighted delta_u + Dual-Horizon auxiliary supervision."""
     probs = jnp.clip(oracle_out["probs_4x4"], 1e-7, 1.0)
-    # Cross-entropy averaged across all 4 seats (and batch)
+    # Cross-entropy averaged across all 4 seats (and valid batch samples)
     ce_per_seat = -jnp.sum(targets_4x4 * jnp.log(probs), axis=-1)  # (N, 4)
-    main_loss = jnp.mean(ce_per_seat)
+    if valid_mask is not None:
+        main_loss = masked_mean(jnp.mean(ce_per_seat, axis=-1), valid_mask)
+    else:
+        main_loss = jnp.mean(ce_per_seat)
+
+    if delta_u_target_ego is not None and "delta_u_ego" in oracle_out:
+        ego_w = float(cfg.ego_seat_loss_weight)
+        seat_w_raw = jnp.array([ego_w, 1.0, 1.0, 1.0], dtype=jnp.float32)
+        seat_w = seat_w_raw / jnp.mean(seat_w_raw)
+        du_err = oracle_out["delta_u_ego"] - delta_u_target_ego.astype(jnp.float32)
+        du_huber = jnp.mean(seat_w[None, :] * optax.huber_loss(du_err, delta=0.25), axis=-1)
+        delta_u_loss = masked_mean(du_huber, valid_mask) if valid_mask is not None else jnp.mean(du_huber)
+    else:
+        delta_u_loss = jnp.array(0.0, dtype=jnp.float32)
 
     # Dual-horizon auxiliary losses (if targets provided)
     if round_winner_ego is not None and aux_valid is not None:
@@ -292,11 +308,17 @@ def compute_oracle_loss_v6(
     else:
         score_loss = jnp.array(0.0, dtype=jnp.float32)
 
-    total = main_loss + float(cfg.round_win_loss_coef) * win_loss + float(cfg.round_score_loss_coef) * score_loss
+    total = (
+        main_loss
+        + float(cfg.delta_u_loss_coef) * delta_u_loss
+        + float(cfg.round_win_loss_coef) * win_loss
+        + float(cfg.round_score_loss_coef) * score_loss
+    )
     birkhoff_err = compute_birkhoff_error(oracle_out["probs_4x4"])
     metrics = {
         "oracle_loss": total,
         "oracle_rank_ce": main_loss,
+        "oracle_delta_u_loss": delta_u_loss,
         "oracle_win_ce": win_loss,
         "oracle_score_huber": score_loss,
         "oracle_birkhoff_err": birkhoff_err,
@@ -635,6 +657,23 @@ class SelfHealingManager:
 
         self.current_lr_scale *= 0.5
         return HealthReport(healthy=False, reasons=tuple(reasons), action_taken="rollback_and_halve_lr")
+
+    def is_snapshot_safe(self, metrics: Dict[str, float]) -> bool:
+        """Return False when policy already drifted toward KL/entropy/Riichi boundaries."""
+        if float(metrics.get("approx_kl", 0.0)) > 0.5 * float(self.cfg.max_approx_kl):
+            return False
+        if float(metrics.get("policy_entropy", 1.0)) < float(self.cfg.min_policy_entropy) + 0.05:
+            return False
+        if "p_riichi_legal" in metrics and float(metrics.get("n_riichi_legal", 0.0)) > 0.0:
+            p_r = float(metrics["p_riichi_legal"])
+            if p_r > float(self.cfg.safe_snapshot_max_p_riichi):
+                return False
+            if self.riichi_window:
+                win_n = sum(x[1] for x in self.riichi_window)
+                win_p = sum(x[0] for x in self.riichi_window) / max(win_n, 1e-8)
+                if win_p > float(self.cfg.safe_snapshot_max_p_riichi):
+                    return False
+        return True
 
     def restore_latest(self) -> Optional[Dict[str, Any]]:
         if not self.snapshots:

@@ -176,8 +176,9 @@ def sample_meta_table_pool(
 
     env_ids = jnp.arange(num_envs, dtype=jnp.int32)
     is_pfsp_env = (env_ids >= n_hom) & (env_ids < n_hom + n_pfsp)
-    # On PFSP tables, seat 0 is the active learner, seats 1..3 are the sampled frozen snapshot
-    pfsp_seats = jnp.array([True, False, False, False], dtype=jnp.bool_)
-    all_seats = jnp.array([True, True, True, True], dtype=jnp.bool_)
-    learning_seat_mask = jnp.where(is_pfsp_env[:, None], pfsp_seats[None, :], all_seats[None, :])
+    # Rotate PFSP learning seat evenly across [0, 1, 2, 3] so dealer/seat biases are eliminated
+    pfsp_seat_ids = jnp.mod(jnp.maximum(env_ids - n_hom, 0), 4)
+    pfsp_seats = jax.nn.one_hot(pfsp_seat_ids, 4, dtype=jnp.bool_)
+    all_seats = jnp.ones((4,), dtype=jnp.bool_)
+    learning_seat_mask = jnp.where(is_pfsp_env[:, None], pfsp_seats, all_seats[None, :])
     return w_tables, is_pfsp_env, learning_seat_mask

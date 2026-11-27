@@ -78,13 +78,32 @@ class OracleCriticNet(nn.Module):
                 river_valid_mask = river_valid_mask[None, ...]
 
         bsz = planes.shape[0]
+        ora_f = oracle_planes.astype(jnp.float32)
         full_planes = jnp.concatenate(
-            [planes.astype(jnp.float32), oracle_planes.astype(jnp.float32)],
+            [planes.astype(jnp.float32), ora_f],
             axis=1,
         )  # (B, 79, 34)
 
+        # Symmetric 36x-equivariant opponent tenpai / furiten / live-wait scalars derived over tile axis
+        live_wall_cnt = jnp.sum(ora_f[:, 15:19, :], axis=1)             # (B, 34) in [0..4]
+        opp_waits = (ora_f[:, 20:23, :] > 0.5).astype(jnp.float32)      # (B, 3, 34)
+        opp_nf_waits = (ora_f[:, 23:26, :] > 0.5).astype(jnp.float32)   # (B, 3, 34)
+        opp_is_tenpai = (jnp.sum(opp_waits, axis=-1) > 0.5).astype(jnp.float32)
+        opp_has_nf = (jnp.sum(opp_nf_waits, axis=-1) > 0.5).astype(jnp.float32)
+        opp_is_furiten = opp_is_tenpai * (1.0 - opp_has_nf)
+        opp_wait_types = jnp.clip(jnp.sum(opp_waits, axis=-1) / 9.0, 0.0, 2.0)
+        opp_live_waits = jnp.clip(jnp.sum(opp_waits * live_wall_cnt[:, None, :], axis=-1) / 16.0, 0.0, 2.0)
+        opp_nf_live_waits = jnp.clip(jnp.sum(opp_nf_waits * live_wall_cnt[:, None, :], axis=-1) / 16.0, 0.0, 2.0)
+        opp_tenpai_scalars = jnp.concatenate(
+            [opp_is_tenpai, opp_is_furiten, opp_wait_types, opp_live_waits, opp_nf_live_waits],
+            axis=-1,
+        )  # (B, 15)
+
         w_flat = w_table_ego.astype(jnp.float32).reshape((bsz, NUM_PLAYERS * NUM_PLAYERS))
-        cond_vec = jnp.concatenate([scalars.astype(jnp.float32), w_flat], axis=-1)  # (B, 72)
+        cond_vec = jnp.concatenate(
+            [scalars.astype(jnp.float32), w_flat, opp_tenpai_scalars],
+            axis=-1,
+        )  # (B, 87)
 
         # Strictly stop-gradient on reused river spatial features so Belief & Oracle remain isolated!
         stopped_river = (

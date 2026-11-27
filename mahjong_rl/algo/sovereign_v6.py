@@ -25,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from mahjax.common.action import Action
 from mahjong_rl.config import BeliefConfig, OracleConfig, RNaDConfig
 
 NEG_INF = -1e9
@@ -225,15 +226,38 @@ def compute_policy_loss_v6(
     approx_kl = masked_mean((ratio - 1.0) - log_ratio, active_mask)
     clip_frac = masked_mean((jnp.abs(ratio - 1.0) > float(cfg.clip_eps)).astype(jnp.float32), active_mask)
     entropy = masked_mean(masked_entropy(logits, mask), active_mask)
+
+    # Behavioral anchor & Riichi/Call tendency probes (zero extra forward passes)
+    log_bc = masked_categorical_log_probs(bc_logits, mask)
+    bc_kl = masked_mean(masked_kl_divergence(pi_probs, log_pi, log_bc, mask), active_mask)
+    riichi_legal_m = active_mask & mask[:, Action.RIICHI]
+    p_riichi_sum = jnp.sum(jnp.where(riichi_legal_m, pi_probs[:, Action.RIICHI], 0.0))
+    n_riichi_legal = jnp.sum(riichi_legal_m.astype(jnp.float32))
+    p_riichi_legal = p_riichi_sum / jnp.maximum(n_riichi_legal, 1e-8)
+
+    call_mask_actions = mask[:, Action.PON : Action.CHI_R_RED + 1]
+    call_legal_m = active_mask & jnp.any(call_mask_actions, axis=-1)
+    p_call_row = jnp.sum(jnp.where(call_mask_actions, pi_probs[:, Action.PON : Action.CHI_R_RED + 1], 0.0), axis=-1)
+    p_call_sum = jnp.sum(jnp.where(call_legal_m, p_call_row, 0.0))
+    n_call_legal = jnp.sum(call_legal_m.astype(jnp.float32))
+    p_call_legal = p_call_sum / jnp.maximum(n_call_legal, 1e-8)
+
     metrics = {
         "policy_loss": total_loss,
         "ppo_loss": ppo_loss,
         "rnad_kl": masked_mean(kl_rnad, active_mask),
+        "bc_kl": bc_kl,
         "shield_loss": shield_loss,
         "approx_kl": approx_kl,
         "clip_frac": clip_frac,
         "policy_entropy": entropy,
         "active_frac": jnp.mean(active_mask.astype(jnp.float32)),
+        "p_riichi_legal": p_riichi_legal,
+        "p_riichi_sum": p_riichi_sum,
+        "n_riichi_legal": n_riichi_legal,
+        "p_call_legal": p_call_legal,
+        "p_call_sum": p_call_sum,
+        "n_call_legal": n_call_legal,
     }
     return total_loss, metrics
 
@@ -418,11 +442,15 @@ def reset_adam_first_moment_only(opt_state: Any) -> Any:
     return _transform(opt_state)
 
 
-def set_injected_lr(opt_state: Any, new_lr: float) -> Any:
-    """Update `lr` inside an `optax.InjectStatefulHyperparamsState` with zero XLA recompile."""
+def set_injected_lr(opt_state: Any, new_lr: float, n_devices: int = 1) -> Any:
+    """Update `lr` inside `optax.InjectStatefulHyperparamsState` with zero XLA recompile or moment copy."""
     if hasattr(opt_state, "hyperparams") and "lr" in opt_state.hyperparams:
         new_hp = dict(opt_state.hyperparams)
-        new_hp["lr"] = jnp.asarray(new_lr, dtype=jnp.float32)
+        if int(n_devices) > 1:
+            lr_arr = np.full((int(n_devices),), float(new_lr), dtype=np.float32)
+            new_hp["lr"] = shard_for_pmap(lr_arr, int(n_devices))
+        else:
+            new_hp["lr"] = jnp.asarray(new_lr, dtype=jnp.float32)
         return opt_state._replace(hyperparams=new_hp)
     return opt_state
 
@@ -547,17 +575,23 @@ class HealthReport:
 
 @dataclass
 class SelfHealingManager:
-    """Monitors the 6 V6 training health probes and executes automatic rollback + LR halving."""
+    """Monitors the V6 training health probes and executes automatic rollback + LR halving."""
 
     cfg: RNaDConfig
     max_snapshots: int = 3
-    snapshots: Deque[Dict[str, Any]] = field(default_factory=lambda: deque(maxlen=3))
+    snapshots: Deque[Dict[str, Any]] = field(init=False)
+    riichi_window: Deque[Tuple[float, float]] = field(init=False)
     consecutive_heals: int = 0
     current_lr_scale: float = 1.0
+
+    def __post_init__(self) -> None:
+        self.snapshots = deque(maxlen=max(1, int(self.max_snapshots)))
+        self.riichi_window = deque(maxlen=max(1, int(self.cfg.riichi_probe_window)))
 
     def save_checkpoint(self, step: int, payload: Dict[str, Any]) -> None:
         self.snapshots.append({"step": step, "payload": jax.device_get(payload)})
         self.consecutive_heals = 0
+        self.riichi_window.clear()
 
     def evaluate_probes(
         self,
@@ -576,10 +610,23 @@ class SelfHealingManager:
             reasons.append(f"birkhoff_err={metrics.get('oracle_birkhoff_err'):.5f}>{self.cfg.max_birkhoff_err}")
         if float(distinct_deck_ratio) < float(self.cfg.min_distinct_deck_ratio):
             reasons.append(f"distinct_deck_ratio={distinct_deck_ratio:.3f}<{self.cfg.min_distinct_deck_ratio}")
-        if "belief_live_auc" in metrics and float(metrics["belief_live_auc"]) < 0.55:
-            reasons.append(f"belief_live_auc={metrics['belief_live_auc']:.3f}<0.55")
+        if "p_riichi_legal" in metrics and float(metrics.get("n_riichi_legal", 0.0)) > 0.0:
+            n_r = float(metrics.get("n_riichi_legal", 0.0))
+            p_r = float(metrics["p_riichi_legal"])
+            self.riichi_window.append((p_r * n_r, n_r))
+            win_n = sum(x[1] for x in self.riichi_window)
+            win_p = sum(x[0] for x in self.riichi_window) / max(win_n, 1e-8)
+            if (
+                win_n >= float(self.cfg.riichi_probe_min_samples)
+                and win_p > float(self.cfg.max_p_riichi_legal)
+                and p_r > float(self.cfg.max_p_riichi_legal)
+            ):
+                reasons.append(
+                    f"p_riichi_legal_win={win_p:.3f}(curr={p_r:.3f},n={int(win_n)})>{self.cfg.max_p_riichi_legal}"
+                )
 
         if not reasons:
+            self.consecutive_heals = 0
             return HealthReport(healthy=True)
 
         self.consecutive_heals += 1
@@ -592,5 +639,6 @@ class SelfHealingManager:
     def restore_latest(self) -> Optional[Dict[str, Any]]:
         if not self.snapshots:
             return None
+        self.riichi_window.clear()
         snap = self.snapshots[-1]
         return jax.device_put(snap["payload"])

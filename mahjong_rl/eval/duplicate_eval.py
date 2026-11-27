@@ -54,9 +54,12 @@ def evaluate_duplicate_1v3(
             state, rng = carry
             done = state.terminated | state.truncated
             rng, k1, k2 = jax.random.split(rng, 3)
-            # Derive deterministic per-step wall key from wall_step_seed so all 4 duplicate
-            # rotations draw from identical walls on identical round transitions
-            k_step = jax.random.fold_in(wall_step_seed, step_idx)
+            # Derive deterministic kyoku-aligned wall key from (round, honba) so all 4 duplicate
+            # rotations see identical deals on identical kyokus regardless of turn-count drift!
+            kyoku_id = state.round_state.round.astype(jnp.int32) * 64 + jnp.minimum(
+                state.round_state.honba.astype(jnp.int32), 63
+            )
+            k_step = jax.random.fold_in(wall_step_seed, kyoku_id)
 
             is_dummy = state.legal_action_mask[Action.DUMMY]
             cp = state.current_player.astype(jnp.int32)
@@ -84,8 +87,7 @@ def evaluate_duplicate_1v3(
             rewards = next_state.rewards.astype(jnp.float32)
             is_hora = won.any()
             is_ron = is_hora & ((rewards < 0.0).sum() == 1)
-            last_p = next_state.round_state.last_player.astype(jnp.int32)
-            dealt_in_mask = jnp.zeros(num_players, dtype=jnp.bool_).at[last_p].set(is_ron)
+            dealt_in_mask = is_ron & (rewards < 0.0)
 
             cand_won = hand_ended & won[agent_seat]
             cand_dealt_in = hand_ended & dealt_in_mask[agent_seat]
@@ -165,10 +167,17 @@ def evaluate_duplicate_1v3(
     finished_np = np.concatenate(fin_list, axis=0)
 
     # Paired duplicate statistics: average across the 4 seat rotations per wall first!
-    wall_mean_pts = pts_np.mean(axis=1)  # (num_walls,)
+    # Filter to fully-finished walls when at least 1 wall finished all 4 seats so timed-out
+    # multi-renchan / sudden-death walls never pollute placement or Tenhou pt averages.
+    wall_done = finished_np.all(axis=1)
+    finished_wall_ratio = float(wall_done.mean())
+    eval_mask = wall_done if bool(wall_done.any()) else np.ones((cfg.num_walls,), dtype=bool)
+    wall_mean_pts = pts_np[eval_mask].mean(axis=1)  # (n_eval_walls,)
     pt_mean = float(wall_mean_pts.mean())
-    pt_se = float(wall_mean_pts.std(ddof=1) / np.sqrt(max(cfg.num_walls, 1))) if cfg.num_walls > 1 else 0.0
+    n_eval_w = int(wall_mean_pts.shape[0])
+    pt_se = float(wall_mean_pts.std(ddof=1) / np.sqrt(max(n_eval_w, 1))) if n_eval_w > 1 else 0.0
     pt_ci95 = 1.96 * pt_se
+    eval_ranks_np = rank_idxs_np[eval_mask]
 
     total_games = int(rank_idxs_np.size)
     total_hands = float(np.asarray(totals["hands"]).sum())
@@ -180,13 +189,14 @@ def evaluate_duplicate_1v3(
         "total_games": float(total_games),
         "total_hands": total_hands,
         "finished_game_ratio": float(finished_np.mean()),
+        "finished_wall_ratio": finished_wall_ratio,
         "tenhou_pt_mean": pt_mean,
         "tenhou_pt_ci95": pt_ci95,
-        "avg_rank": float(rank_idxs_np.mean() + 1.0),
-        "rank_1_rate": float((rank_idxs_np == 0).mean()),
-        "rank_2_rate": float((rank_idxs_np == 1).mean()),
-        "rank_3_rate": float((rank_idxs_np == 2).mean()),
-        "rank_4_rate": float((rank_idxs_np == 3).mean()),
+        "avg_rank": float(eval_ranks_np.mean() + 1.0),
+        "rank_1_rate": float((eval_ranks_np == 0).mean()),
+        "rank_2_rate": float((eval_ranks_np == 1).mean()),
+        "rank_3_rate": float((eval_ranks_np == 2).mean()),
+        "rank_4_rate": float((eval_ranks_np == 3).mean()),
         "hora_rate": total_won / denom_hands,
         "deal_in_rate": total_dealt / denom_hands,
         "riichi_rate": float(np.asarray(totals["riichi"]).sum()) / denom_hands,

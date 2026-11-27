@@ -87,22 +87,22 @@ class OracleConfig:
 class RNaDConfig:
     """P3 Clean Unbiased Asymmetric PPO + R-NaD + Triple-Armor Safety Shield + PFSP."""
 
-    # Dual-rate Simplex TD(lambda): long intra-round credit + bounded cross-round variance
-    lambda_intra: float = 0.975       # ~0.903 per own turn -> 36.4% credit at 10 own turns
+    # Dual-rate Simplex TD(lambda): round-horizon MC (lambda_intra=1.0) avoids ego-perspective critic bootstrap bias
+    lambda_intra: float = 1.0         # 1.0 = exact round-end return (no intra-round Oracle bootstrapping)
     lambda_inter: float = 0.70        # Convex blend with GRP_EMA at round boundaries
 
     # Running-RMS advantage scaling (NO mean subtraction, active_mask only)
     running_rms_beta: float = 0.99
     running_rms_eps: float = 1e-5
 
-    # PPO-Clip + R-NaD discrete hard-reset magnet (calibrated to unit-RMS advantage)
+    # PPO-Clip + R-NaD discrete hard-reset magnet (tuned for gentle fine-tuning over 79% BC)
     clip_eps: float = 0.20
-    alpha_rnad: float = 0.05
-    outer_reset_steps: int = 1200     # Single-GPU scaled outer epoch (10 epochs in ~50M steps)
+    alpha_rnad: float = 0.08
+    outer_reset_steps: int = 400      # 400 updates per outer epoch (~1.6M steps/epoch at B=32,T=128)
     reset_warmup_steps: int = 30      # Short LR warmup after AdamW m_t surgical reset
-    # Dual-anchor entropy floor on rho_{k+1} = 0.95*pi_k + 0.035*pi_bc + 0.015*U_legal
-    rho_mix_bc: float = 0.035
-    rho_mix_uniform: float = 0.015
+    # Dual-anchor entropy floor on rho_{k+1} = (1 - mix_bc - mix_u)*pi_k + mix_bc*pi_bc + mix_u*U_legal
+    rho_mix_bc: float = 0.10
+    rho_mix_uniform: float = 0.003
 
     # Triple-Armor Softened Support-Set Safety Shield
     bc_soft_temp: float = 1.8
@@ -113,18 +113,21 @@ class RNaDConfig:
     shield_decay_scale: float = 0.30
 
     # Policy optimizer (isolated from Oracle & Belief)
-    policy_lr: float = 1.5e-4
+    policy_lr: float = 4e-5
     policy_weight_decay: float = 1e-4
     policy_grad_clip: float = 0.5
 
-    # Sparse static-capacity legal-ron compaction in update phase
-    ron_k_max: int = 1024
+    # Freeze Phase 0 calibrated BeliefNet during RL by default to prevent Ron-truncation poisoning
+    freeze_belief: bool = True
+    # Sparse static-capacity legal-ron compaction when freeze_belief=False (auto-floored to 2 * n_per_dev)
+    ron_k_max: int = 8192
     # Per-rollout single-snapshot PFSP elite pool size
     pfsp_pool_size: int = 8
     utility_dropout: float = 0.20
 
-    # Phase 1 frozen-policy warmup gates (before unlocking policy updates)
-    warmup_updates: int = 50
+    # Phase 1 frozen-policy warmup & Oracle readiness gates before unlocking policy updates
+    # (`warmup_ece_gate` & `warmup_auc_gate` are Phase 0 GRP/Belief validation gates kept for config compatibility)
+    warmup_updates: int = 100
     warmup_ece_gate: float = 0.04
     warmup_auc_gate: float = 0.85
 
@@ -134,6 +137,10 @@ class RNaDConfig:
     min_policy_entropy: float = 0.35
     min_distinct_deck_ratio: float = 0.95
     max_birkhoff_err: float = 1e-3
+    max_p_riichi_legal: float = 0.78
+    riichi_probe_window: int = 5
+    riichi_probe_min_samples: int = 160
+    max_outer_snapshots: int = 5
     max_consecutive_heals: int = 5
 
 
@@ -170,7 +177,7 @@ class RLConfig:
     num_envs: int = 32
     num_steps: int = 128
     num_updates: int = 12000          # ~49.2M env steps = 10 complete R-NaD outer epochs
-    update_epochs: int = 4
+    update_epochs: int = 2
     minibatch_size: int = 1024        # Micro-batch sized for <0.5GB dynamic activations
     seed: int = 0
 
@@ -182,7 +189,7 @@ class EvalConfig:
     env_name: Literal["red_4p", "no_red_4p"] = "red_4p"
     round_mode: Literal["single", "east", "half"] = "half"
     num_walls: int = 250              # Total games = 4 * num_walls
-    max_steps: int = 1600
+    max_steps: int = 2400
     rank_points: Tuple[float, float, float, float] = (90.0, 45.0, 0.0, -135.0)
     seed: int = 42
 

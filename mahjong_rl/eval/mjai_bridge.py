@@ -63,11 +63,11 @@ def make_v6_policy_actor(
         belief_ema_params = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), belief_ema_params)
         grp_base_params = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), grp_base_params)
         w_tab = np.asarray(jax.device_get(make_homogeneous_table(w_rule) if w_table_abs is None else w_table_abs), dtype=np.float32)
-        w_rule_val = np.asarray(jax.device_get(w_rule), dtype=np.float32)
+        w_default_prior = np.asarray(jax.device_get(W_PHOENIX_7D), dtype=np.float32)
         is_known_vec = np.full((3,), 1.0 if opp_rules_known else 0.0, dtype=np.float32)
     else:
         w_tab = make_homogeneous_table(w_rule) if w_table_abs is None else jnp.asarray(w_table_abs, dtype=jnp.float32)
-        w_rule_val = w_rule
+        w_default_prior = W_PHOENIX_7D
         is_known_vec = jnp.full((3,), 1.0 if opp_rules_known else 0.0, dtype=jnp.float32)
     grp_fn = lambda gf: grp_model.apply(grp_base_params, gf)
 
@@ -80,12 +80,14 @@ def make_v6_policy_actor(
         tbl = extract_table_snapshot(clean_st)
         w_ego_4x4 = rotate_utility_matrix_ego(w_tab, cp)
         w_me = w_ego_4x4[0]
+        # Unknown opponents always fall back to the room-average 7d prior seen during training
+        # (`is_known=0.0` + `W_PHOENIX_7D`), preserving zero-shot `w_rule` switching!
         w_opp_5d = build_opponent_utility_features(
             w_ego_4x4[1:],
             is_known_vec,
             rng_key=None,
             dropout_prob=0.0,
-            w_table_default=w_rule_val,
+            w_table_default=w_default_prior,
         )
 
         b_out = belief_model.apply(

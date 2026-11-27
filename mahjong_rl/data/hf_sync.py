@@ -444,6 +444,7 @@ def upload_checkpoints_to_hf(
     token: Optional[str] = None,
     secret_name: str = "HF_TOKEN",
     commit_message: Optional[str] = None,
+    delete_patterns: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Upload Sovereign-Mahjong V6 checkpoints & audit reports to a HF Model repo."""
     from huggingface_hub import HfApi
@@ -475,6 +476,7 @@ def upload_checkpoints_to_hf(
         repo_id=repo_id,
         repo_type="model",
         allow_patterns=["*.pkl", "*.json", "*.png", "*.md"],
+        delete_patterns=delete_patterns,
         commit_message=msg,
     )
     url = f"https://huggingface.co/{repo_id}"

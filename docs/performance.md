@@ -191,21 +191,32 @@ policy/belief/GRP 参数做 `np.asarray(jax.device_get(x))`，以便 pmap 干净
 ### 5.7 建议的 batch 扫描
 
 Kaggle 每卡只有 `num_envs / 2` 个环境；T4 单卡比 3060 慢，但 16 envs/卡 仍可能偏小。
-用 3 个 update 扫一遍（看第 2/3 个 update 的 `sps`，第 1 个含编译）：
+用 4 个 update 扫一遍；**第 1、2 个 update 各含一次编译，只有第 3/4 个 update 是稳态**：
 
 ```bash
-for B in 32 64 128; do
+for B in 128 256; do
   echo "=== num_envs=$B ==="
   python -m mahjong_rl.trainers.run_local_rl \
-    --out-dir /kaggle/working/bench_b$B \
-    --num-envs $B --num-steps 256 --num-updates 3 --warmup-updates 0 \
+    --out-dir /kaggle/tmp/bench_b$B \
+    --num-envs $B --num-steps 256 --num-updates 4 --warmup-updates 0 \
     --eval-every 0 --checkpoint-every 0 --log-every 1 --no-resume \
     2>&1 | grep -E "\[RL |envs="
 done
 ```
 
-- 若 `sps` 在 32→64 明显上升，就停在拐点；32→64 持平说明每卡 16 envs 已 compute-bound。
-- `--minibatch-size` 必须能被 `2` 整除（默认 512 可以）。
+#### Kaggle 2×T4 实测（2026-11，`minibatch_size=2048`）
+
+| `num_envs` | 每卡 envs | upd 3 稳态 | upd 3 耗时 | 备注 |
+|---|---|---|---|---|
+| 32 | 16 | **1,174 sps** | 7.0 s | upd 1 ≈ 252 s，upd 2 ≈ 182 s |
+| 64 | 32 | **1,486 sps** | 11.0 s | upd 1 ≈ 208 s，upd 2 ≈ 186 s |
+| 128 | 64 | **1,766 sps** | 18.6 s | upd 1 ≈ 214 s，upd 2 ≈ 193 s |
+
+结论：
+- 32→64→128 仍在上升，但边际递减；**先上 128（每卡 64），再补测 256**。
+- 不要用均值 `(upd2+upd3)/2` 当稳态：upd 2 是一次性编译，会把结果压低约 2×。
+- 第 2 个 update 的编译来源尚未定位；可用 `JAX_LOG_COMPILES=1` 观察是哪个 pmap 图。
+- `--minibatch-size` 必须能被 `2` 整除（默认 512/1024 都可以）。
 
 ### 5.8 Kaggle 会话与磁盘
 
@@ -222,12 +233,12 @@ done
       （确认双卡 tracer 修复生效）
 - [ ] **缓存**：`export JAX_COMPILATION_CACHE_DIR=/kaggle/working/.jax_cache`
       （会话结束可把它作为 Output/Dataset 保存，下次继续复用）
-- [ ] **batch sweep**：`B=32 / 64 / 128` 各跑 3 个 update，记录第 2/3 个
-      update 的 `sps`；Notebook 的 **2.5 节**已内置这段扫描
+- [ ] **batch sweep**：`B=128 / 256` 各跑 4 个 update，记录第 3/4 个
+      update 的 `sps`（前两个含编译）；Notebook 的 **2.5 节**已内置这段扫描
 - [ ] **评测参数**：`--eval-chunk-walls` 是**每卡**墙数；
       `--eval-walls` 取 `chunk_walls × GPU 数` 的整数倍，避免 padding 浪费
 - [ ] **checkpoint**：`--checkpoint-every 50~100`，输出到 `/kaggle/working`
-- [ ] **正式训练**：`--num-envs` 取 sweep 的拐点值（2×T4 通常从 64 起步）
+- [ ] **正式训练**：`--num-envs` 取 sweep 的拐点值（2×T4 实测 **128** 最好，再试 256）
 
 当前 Notebook（`notebooks/sovereign_mahjong_v6_kaggle.ipynb`）已经：
 - 默认拉取 `perf/jax-throughput-kaggle` 分支（合并回 main 后改回 `main`）；

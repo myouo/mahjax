@@ -133,6 +133,18 @@ def _clone_host_params(params: Any) -> Any:
     return jax.tree_util.tree_map(lambda x: np.array(jax.device_get(x), copy=True), params)
 
 
+_PROFILE = os.environ.get("MAHJAX_PROFILE", "0") == "1"
+
+
+def _prof_mark(marks: Optional[Dict[str, float]], name: str, t0: float) -> float:
+    """Opt-in coarse update-phase timer; set `MAHJAX_PROFILE=1` to populate it."""
+    if marks is None:
+        return t0
+    t1 = time.perf_counter()
+    marks[name] = marks.get(name, 0.0) + (t1 - t0)
+    return t1
+
+
 def _validate_resume_shapes(name: str, expected: Any, loaded: Any, resume_path: Any) -> None:
     exp_shapes = [tuple(np.asarray(x).shape) for x in jax.tree_util.tree_leaves(expected)]
     got_shapes = [tuple(np.asarray(x).shape) for x in jax.tree_util.tree_leaves(loaded)]
@@ -1264,6 +1276,8 @@ def train_rl_v6(
 
     for upd in range(start_update, cfg.num_updates):
         t_upd_start = time.perf_counter()
+        _marks: Optional[Dict[str, float]] = {} if _PROFILE else None
+        _t = t_upd_start
         in_warmup = not warmup_unlocked
 
         # Outer R-NaD hard reset at every `outer_reset_steps` (when > 0) or healthy PFSP snapshotting (when <= 0)
@@ -1335,11 +1349,13 @@ def train_rl_v6(
             t_cal_arr,
             k_roll_exec,
         )
+        _t = _prof_mark(_marks, "rollout", _t)
 
         # Structural deck uniqueness probe
         raw_decks = np.asarray(jax.device_get(env_state.round_state.deck))
         decks_sig = raw_decks.reshape((cfg.num_envs, -1))[:, :8]
         distinct_ratio = len({row.tobytes() for row in decks_sig}) / max(cfg.num_envs, 1)
+        _t = _prof_mark(_marks, "deck_probe", _t)
 
         prepare_fn = prepare_warmup_fn if in_warmup else prepare_full_fn
         (
@@ -1363,6 +1379,7 @@ def train_rl_v6(
                 f"[RL WARNING] upd {upd + 1}: ron_k_max overflowed — skipped BeliefNet update to prevent poisoning!",
                 flush=True,
             )
+        _t = _prof_mark(_marks, "prepare", _t)
 
         phase2_total = max(int(cfg.num_updates) - int(cfg.rnad.warmup_updates) - 1, 1)
         progress = 0.0 if in_warmup else min(1.0, float(phase2_step) / float(phase2_total))
@@ -1449,6 +1466,7 @@ def train_rl_v6(
                         all_finite = False
                     for mk, mv in m_ora_single.items():
                         upd_metrics_acc.setdefault(mk, []).append(float(mv))
+        _t = _prof_mark(_marks, "oracle_update", _t)
 
         # 2. Strictly On-Policy Belief / Policy Update (skipped during warmup when freeze_belief=True)
         bel_pi_step_fn = update_bel_pi_warmup if in_warmup else update_bel_pi_full
@@ -1514,6 +1532,7 @@ def train_rl_v6(
                 ("beta_offense", 0.0),
             ):
                 upd_metrics_acc[mk] = [mv]
+        _t = _prof_mark(_marks, "policy_update", _t)
 
         jax.block_until_ready((params_pi, params_oracle))
         upd_wall_s = max(time.perf_counter() - t_upd_start, 1e-6)
@@ -1591,6 +1610,8 @@ def train_rl_v6(
                     f"finite={all_finite}, birkhoff_err={summary.get('oracle_birkhoff_err', 1.0):.5f}."
                 )
 
+        _t = _prof_mark(_marks, "metrics", _t)
+
         # Self-healing probe evaluation
         heal_reasons_str = ""
         health_action = "none"
@@ -1635,6 +1656,15 @@ def train_rl_v6(
                         "rms_state": _unrep(rms_state),
                     },
                 )
+        _t = _prof_mark(_marks, "health", _t)
+        if _PROFILE:
+            print(
+                f"[PROFILE upd {upd + 1}] "
+                + " | ".join(f"{k}={v:.2f}s" for k, v in _marks.items())
+                + f" | total={time.perf_counter() - t_upd_start:.2f}s",
+                flush=True,
+            )
+
         if not in_warmup and (not aborted):
             phase2_step += 1
         history.append(summary)

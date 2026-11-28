@@ -291,20 +291,74 @@ wall_time ≈ total_transitions / sps
 当前 Notebook（`notebooks/sovereign_mahjong_v6_kaggle.ipynb`）已经：
 - 默认拉取 `perf/jax-throughput-kaggle` 分支（合并回 main 后改回 `main`）；
 - 在 2.5 节提供可直接运行的 batch sweep（解析 `sps` 并汇总）；
-- T4×2 预设为 `RL_NUM_ENVS=64`（每卡 32），并标注了 sweep 后如何调整。
+- T4×2 预设为 `RL_NUM_ENVS=128`（每卡 64）。
+
+### 5.10 训练稳态的时间构成（实测）
+
+用 `MAHJAX_PROFILE=1` 跑 3 个 update 可以打印每个阶段的耗时：
+
+```bash
+MAHJAX_PROFILE=1 python -m mahjong_rl.trainers.run_local_rl \
+  --num-updates 3 --warmup-updates 0 --eval-every 0 --checkpoint-every 0 --no-resume
+```
+
+**阶段级（B=32，单卡 3060，稳态 update 2/3）：**
+
+| 阶段 | 占比 |
+|---|---|
+| rollout | ~43% |
+| policy update (PPO + R-NaD) | ~42% |
+| oracle update | ~10–14% |
+| prepare（含 BC/rho 全量前向） | ~1.5% |
+| host probe / metrics / health | <1% |
+
+**rollout 内部单步组件（B=128，单卡 3060；各组件单独 jit，非严格可加）：**
+
+| 组件 | 耗时 |
+|---|---|
+| `env.step`（合法动作） | 9.6 ms |
+| trinity（4 次 batched GRP） | 3.8 ms |
+| policy forward（self-play；PFSP 再 ×1） | 3.5 ms |
+| belief forward | 2.4 ms |
+| oracle forward | 2.1 ms |
+| `encode_oracle_planes` | 1.9 ms |
+| `grp.apply`（EMA next） | 1.7 ms |
+| `encode_obs_v6` | 1.1 ms |
+
+注意：`env.step` 在 128 envs 时受占用率限制；官方
+`benchmarks/step_speed.py --batch 256` 的 `half` 是 **6.25 ms/step（256 envs，
+约 41k env-SPS）**，到 256 envs/卡时 env 的占比会下降。
+
+结论：
+- **训练的大头是模型 forward + policy update**：rollout 中 belief/policy/oracle/
+  trinity/grp_ema 合计约 55–60%，env + obs 约 40%；policy update 又占 update 的 42%。
+- `prepare` 虽然包含一次全量 BC 前向，但只占 ~1.5%，不是优化重点。
+- `lax.scan(unroll=2)` 实测无收益（rollout 5.31s vs 5.07s，编译时间翻倍），不采用。
 
 ---
 
-## 6. 已知剩余优化点
+## 6. 已知剩余优化点（按收益排序）
 
-1. **`evaluate_duplicate_1v3` 每条规则重新编译**：actor 权重是闭包常量。
-   把 `w_rule` / 权重改为 runtime 参数后，`run_phase0` 的 3 条规则可共享一次编译。
-2. **eval 同时算 candidate + baseline**：每步其实只有一方行动，理论上还能省
-   1.5~2×；需要按 `cp == agent_seat` 分组，形状会变，风险较高。
-3. **`encode_obs_v6` 计算两次**：candidate 与 baseline 各自编码一次，可上提共享。
-4. **T4 的 FP16**：T4 的 FP16 Tensor Core 明显快于 FP32。若要上混合精度，
-   需要保持 Sinkhorn / BCE / 对数域稳定在 FP32，并做 loss scaling；属于较大改动，
-   先在分支上做 A/B（建议用 `jmp` 或只对 Conv/Dense 做 cast）。
+1. **FP16 / mixed precision（T4 上最大的单项）**：rollout 的模型前向约占 rollout 的
+   55%，policy update 又占 update 的 42%；T4 的 FP16 Tensor Core 远快于 FP32。
+   建议分两步：
+   - 先只对 **rollout 前向** 用 FP16（输出 cast 回 FP32，无 loss scaling），风险低；
+   - 稳定后再对 policy/oracle 的 forward+backward 用 FP16 + FP32 master weights +
+     loss scaling。
+2. **Trinity 的 4 次 GRP 调用合并成 1 次**：把 current + 31 张 hypothetical table
+   一次性 vmap，减少 3 次 kernel launch 并提高小 batch（3/16）的占用率，预计 3–5%。
+3. **`grp_ema_next` 延迟到 round-end 行**：`lambda_inter=0` 时它只在回合结束用到，
+   现在每个 step 都算（1.7 ms/step）。改为存 29 维 GRP 特征、在 prepare 里只对
+   round-end 行做 GRP，预计 2–3%。
+4. **Oracle replay 常驻显存**：每个 update 把 13 个 key 搬到 host 再采样上传；
+   在 Kaggle 的弱 CPU 上预计 5–10%。
+5. **B=512（256/卡）**：进一步提高 env 占用率，预计 3–5%，但要确认 16GB 显存。
+6. **`evaluate_duplicate_1v3` 每条规则重新编译**：把权重/w_rule 改成 runtime 参数，
+   phase0 的 3 条规则可共享一次编译。
+7. **notebook 的 `CompiledDuplicate1v3Evaluator` 仍是固定 `max_steps` 的 scan**：
+   迁移到 `play_duplicate_chunk` 可拿早停收益。
+8. **pmap 的第二次编译**（update 2 ≈ 200s）：一次性，不占总稳态；用
+   `JAX_LOG_COMPILES=1` 定位后可再省 ~3 分钟/新 shape。
 5. **Kaggle host 侧开销**：Oracle replay 每个 update 都会把 `ORA_BUF_KEYS` 搬到 host
    （numpy 单线程），2~4 vCPU 上可能成为瓶颈。可考虑 replay 常驻显存、
    或降低 host 拷贝频率。

@@ -218,6 +218,28 @@ done
 - 第 2 个 update 的编译来源尚未定位；可用 `JAX_LOG_COMPILES=1` 观察是哪个 pmap 图。
 - `--minibatch-size` 必须能被 `2` 整除（默认 512/1024 都可以）。
 
+#### batch 和“更新预算”要一起看
+
+`sps` 只是吞吐；每个 update 的数据量是：
+
+```text
+transitions_per_update = num_envs × num_steps
+wall_time ≈ total_transitions / sps
+```
+
+- **固定总环境步数**（推荐）：B=128 的 `sps` 比 B=64 高约 1.19×，所以同样的
+  总步数会快约 1.19×。
+- **固定 `num_updates`**：B 加倍 = 每个 update 的数据量和梯度 minibatch 数都加倍，
+  墙钟也近似加倍。以 1000 updates 为例：
+  - B=64（32/GPU）：16.4M steps，约 11.0s/update → **~3.1 h**
+  - B=128（64/GPU）：32.8M steps，约 18.6s/update → **~5.2 h**
+- 如果你只想把原来 B=64/1000 updates 的预算跑快，改成 B=128 时把
+  `RL_NUM_UPDATES` 减半到 500，并把所有**以 update 计**的调度一起减半：
+  `RL_WARMUP_UPDATES` 80→40、`RL_PFSP_SNAPSHOT_INTERVAL` 200→100、
+  `RL_EVAL_EVERY` 250→125。这样总步数和训练节奏基本不变，墙钟约快 1.19×。
+- 如果你愿意用更大的 batch 换更多数据/梯度步，保持 1000 updates 也可以，
+  但要接受 ~5.2 h 的训练时间。
+
 ### 5.8 Kaggle 会话与磁盘
 
 - `rl_resume_state.pkl` 包含 policy/BC/ρ-base/Oracle/Belief 权重、Adam 状态、

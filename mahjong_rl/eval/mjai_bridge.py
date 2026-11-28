@@ -57,8 +57,19 @@ def make_v6_policy_actor(
         greedy: If True, returns argmax legal action; if False, samples from policy logits.
     """
     # Keep closed-over weights device-agnostic (host NumPy) on multi-GPU so `jax.pmap`
-    # replicates them cleanly to every GPU without device-0 affinity conflicts!
-    if jax.local_device_count() > 1:
+    # replicates them cleanly to every GPU without device-0 affinity conflicts.
+    # BUT when this builder is called inside a jit/pmap trace (e.g. the periodic evaluator),
+    # the params are tracers: `np.asarray(tracer)` is illegal, and the caller already passes
+    # them with the right sharding/replication. In that case keep them as JAX values.
+    def _has_tracer(*trees: Any) -> bool:
+        return any(
+            isinstance(x, jax.core.Tracer)
+            for tree in trees
+            for x in jax.tree_util.tree_leaves(tree)
+        )
+
+    _traced = _has_tracer(policy_params, belief_ema_params, grp_base_params, w_rule)
+    if jax.local_device_count() > 1 and not _traced:
         policy_params = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), policy_params)
         belief_ema_params = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), belief_ema_params)
         grp_base_params = jax.tree_util.tree_map(lambda x: np.asarray(jax.device_get(x)), grp_base_params)

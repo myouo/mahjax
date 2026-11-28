@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import mahjax
+from mahjong_rl.algo.sovereign_v6 import replicate_for_pmap, shard_for_pmap
 from mahjong_rl.algo.utility import W_PHOENIX_7D
 from mahjong_rl.config import (
     BeliefConfig,
@@ -71,7 +72,10 @@ class _CompiledDuplicateVsBCEvaluator:
         self.policy_model = policy_model
         self.belief_model = belief_model
         self.grp_model = grp_model
-        self.grp_params = jax.device_get(grp_params) if jax.local_device_count() > 1 else jax.device_put(grp_params)
+        self.n_devices = jax.local_device_count()
+        self._use_pmap = self.n_devices > 1
+        # On multi-GPU keep the frozen GRP weights on host so pmap replicates them as constants.
+        self.grp_params = jax.device_get(grp_params) if self._use_pmap else jax.device_put(grp_params)
         self.belief_t_cal = float(belief_t_cal)
         self.eval_cfg = eval_cfg
         self.chunk_walls = max(1, int(chunk_walls))
@@ -121,7 +125,7 @@ class _CompiledDuplicateVsBCEvaluator:
                 int(eval_cfg.max_steps),
             )
 
-        self._run_jit = jax.jit(eval_chunk)
+        self._run = jax.pmap(eval_chunk) if self._use_pmap else jax.jit(eval_chunk)
         rng = jax.random.PRNGKey(eval_cfg.seed)
         k_init, k_step = jax.random.split(rng)
         self.init_keys = jax.random.split(k_init, eval_cfg.num_walls)
@@ -129,29 +133,58 @@ class _CompiledDuplicateVsBCEvaluator:
 
     def evaluate(self, cand_pol: Any, cand_bel: Any, base_pol: Any, base_bel: Any) -> Dict[str, float]:
         t0 = time.perf_counter()
-        c_p = jax.device_put(cand_pol)
-        c_b = jax.device_put(cand_bel)
-        b_p = jax.device_put(base_pol)
-        b_b = jax.device_put(base_bel)
+        if self._use_pmap:
+            c_p = replicate_for_pmap(cand_pol, self.n_devices)
+            c_b = replicate_for_pmap(cand_bel, self.n_devices)
+            b_p = replicate_for_pmap(base_pol, self.n_devices)
+            b_b = replicate_for_pmap(base_bel, self.n_devices)
+        else:
+            c_p = jax.device_put(cand_pol)
+            c_b = jax.device_put(cand_bel)
+            b_p = jax.device_put(base_pol)
+            b_b = jax.device_put(base_bel)
 
         totals_list, ranks_list, pts_list, fin_list = [], [], [], []
         num_walls = int(self.eval_cfg.num_walls)
-        for start in range(0, num_walls, self.chunk_walls):
-            end = min(start + self.chunk_walls, num_walls)
+        per_launch = self.chunk_walls * self.n_devices
+        for start in range(0, num_walls, per_launch):
+            end = min(start + per_launch, num_walls)
             cnt = end - start
             ik_slice = self.init_keys[start:end]
             ss_slice = self.step_seeds[start:end]
-            if cnt < self.chunk_walls:
-                pad = self.chunk_walls - cnt
+            if cnt < per_launch:
+                pad = per_launch - cnt
                 ik_slice = jnp.concatenate([ik_slice, jnp.repeat(ik_slice[-1:], pad, axis=0)], axis=0)
                 ss_slice = jnp.concatenate([ss_slice, jnp.repeat(ss_slice[-1:], pad, axis=0)], axis=0)
-            t_c, r_c, p_c, f_c = jax.device_get(
-                self._run_jit(c_p, c_b, b_p, b_b, ik_slice, ss_slice)
-            )
-            totals_list.append({k: np.asarray(v)[:cnt] for k, v in t_c.items()})
-            ranks_list.append(np.asarray(r_c[:cnt], dtype=np.int32))
-            pts_list.append(np.asarray(p_c[:cnt], dtype=np.float64))
-            fin_list.append(np.asarray(f_c[:cnt], dtype=np.float64))
+            if self._use_pmap:
+                ik = shard_for_pmap(
+                    ik_slice.reshape((self.n_devices, self.chunk_walls) + ik_slice.shape[1:]),
+                    self.n_devices,
+                )
+                ss = shard_for_pmap(
+                    ss_slice.reshape((self.n_devices, self.chunk_walls) + ss_slice.shape[1:]),
+                    self.n_devices,
+                )
+                t_c, r_c, p_c, f_c = jax.device_get(self._run(c_p, c_b, b_p, b_b, ik, ss))
+                t_c = {
+                    k: np.asarray(v).reshape((per_launch,) + np.asarray(v).shape[2:])[:cnt]
+                    for k, v in t_c.items()
+                }
+                r_c = np.asarray(r_c, dtype=np.int32).reshape((per_launch, self.num_players))[:cnt]
+                p_c = np.asarray(p_c, dtype=np.float64).reshape((per_launch, self.num_players))[:cnt]
+                f_c = np.asarray(f_c, dtype=np.float64).reshape((per_launch, self.num_players))[:cnt]
+            else:
+                t_c, r_c, p_c, f_c = jax.device_get(
+                    self._run(c_p, c_b, b_p, b_b, ik_slice, ss_slice)
+                )
+                t_c = {k: np.asarray(v)[:cnt] for k, v in t_c.items()}
+                r_c = np.asarray(r_c, dtype=np.int32)[:cnt]
+                p_c = np.asarray(p_c, dtype=np.float64)[:cnt]
+                f_c = np.asarray(f_c, dtype=np.float64)[:cnt]
+            totals_list.append(t_c)
+            ranks_list.append(r_c)
+            pts_list.append(p_c)
+            fin_list.append(f_c)
 
         totals = {k: np.concatenate([t[k] for t in totals_list], axis=0) for k in totals_list[0]}
         rank_idxs_np = np.concatenate(ranks_list, axis=0)
@@ -233,7 +266,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--eval-chunk-walls",
         type=int,
         default=16,
-        help="Walls evaluated concurrently; 4*this batched lanes. Lower it if VRAM OOMs.",
+        help="Walls per device per launch (4*this lanes/GPU). Lower it if VRAM OOMs.",
     )
     parser.add_argument("--eval-seed", type=int, default=2026)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)

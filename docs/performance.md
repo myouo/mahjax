@@ -130,8 +130,9 @@
 - 约束：`--num-envs % 2 == 0`，`--minibatch-size % 2 == 0`（默认 32 / 512 都满足）。
 - `num_envs` 是**全局** batch，每卡只有 `num_envs / 2` 个环境。Kaggle 每卡显存 16GB，
   建议从 **`--num-envs 64`** 起步，再试 **128**，用日志里的 `sps` 判断拐点。
-- 1v3 评测 `evaluate_duplicate_1v3` 已经会 `pmap` 到所有设备
-  （每次每卡 `chunk_walls` 个墙）；`run_local_rl` 的周期评测目前只用了 device 0（见第 6 节）。
+- 1v3 评测 `evaluate_duplicate_1v3` 和 `run_local_rl` 的周期评测
+  (`_CompiledDuplicateVsBCEvaluator`) 都会 `pmap` 到所有设备；
+  `--eval-chunk-walls` 的语义是**每卡**并发墙数（每卡 `4*N` 条 lane）。
 
 ### 5.3 编译缓存（Kaggle 上尤其重要）
 
@@ -158,6 +159,8 @@ python -m mahjong_rl.trainers.run_local_rl \
 ```
 
 - `--eval-chunk-walls 32` = 每卡 32 墙 × 4 座位 = 128 lanes；16GB 卡可承受。
+- **建议 `--eval-walls` 是 `--eval-chunk-walls × GPU 数` 的整数倍**（例如 2 卡、
+  chunk=16 时用 `--eval-walls 32`），否则最后一批需要 padding，会重复跑一部分墙。
 - 周期 checkpoint 写到 `/kaggle/working`，避免会话超时丢进度；`rl_resume_state.pkl`
   支持断点续训。
 - 第一次运行仍会编译；之后同 shape 命中缓存。
@@ -167,26 +170,65 @@ python -m mahjong_rl.trainers.run_local_rl \
 16 墙 = 64 局，95% CI 通常仍有 ±10 pt 量级。用于选 best checkpoint 建议至少
 `--eval-walls 32`（128 局）；最终报告用 100+ 墙。
 
+### 5.6 双卡上已修的一个崩溃点
+
+`make_v6_policy_actor` 原本在 `jax.local_device_count() > 1` 时会对传入的
+policy/belief/GRP 参数做 `np.asarray(jax.device_get(x))`，以便 pmap 干净复制。
+但 `run_local_rl` 的周期评测是在 `jax.jit` **内部**构建 actor 的，此时参数是 tracer，
+`np.asarray(tracer)` 会抛 `TracerArrayConversionError` —— 也就是 Kaggle 双卡一开
+`--eval-every` 就会在第一次评测时崩。
+
+现在改为：检测到 tracer 时跳过 host 转换，直接使用调用方已经复制/分片好的参数。
+回归测试：`tests/test_v6_multigpu_trace.py`（在单卡机器上把
+`jax.local_device_count` 伪装成 2 来验证）。
+
+### 5.7 建议的 batch 扫描
+
+Kaggle 每卡只有 `num_envs / 2` 个环境；T4 单卡比 3060 慢，但 16 envs/卡 仍可能偏小。
+用 3 个 update 扫一遍（看第 2/3 个 update 的 `sps`，第 1 个含编译）：
+
+```bash
+for B in 32 64 128; do
+  echo "=== num_envs=$B ==="
+  python -m mahjong_rl.trainers.run_local_rl \
+    --out-dir /kaggle/working/bench_b$B \
+    --num-envs $B --num-steps 256 --num-updates 3 --warmup-updates 0 \
+    --eval-every 0 --checkpoint-every 0 --log-every 1 --no-resume \
+    2>&1 | grep -E "\[RL |envs="
+done
+```
+
+- 若 `sps` 在 32→64 明显上升，就停在拐点；32→64 持平说明每卡 16 envs 已 compute-bound。
+- `--minibatch-size` 必须能被 `2` 整除（默认 512 可以）。
+
+### 5.8 Kaggle 会话与磁盘
+
+- `rl_resume_state.pkl` 包含 policy/BC/ρ-base/Oracle/Belief 权重、Adam 状态、
+  PFSP pool 和 outer snapshots，会随训练变长而变大。`--checkpoint-every 25`
+  在 Kaggle 上可能每次写几十~上百 MB；长跑建议 `50~100`。
+- 把 `--out-dir` 指向 `/kaggle/working/...`；会话超时后用同一目录 `--resume`
+  续训（默认开启）。
+- `--ckpt-dir` 指向只读的 `/kaggle/input/<dataset>` 即可。
+
 ---
 
 ## 6. 已知剩余优化点
 
-1. **`run_local_rl` 周期评测只用 device 0**：`_CompiledDuplicateVsBCEvaluator`
-   目前是 `jax.jit` + `jax.device_put`。在 2×T4 上应该像 `evaluate_duplicate_1v3`
-   一样 `pmap` 到两张卡，评测时间可接近减半。
-2. **`evaluate_duplicate_1v3` 每条规则重新编译**：actor 权重是闭包常量。
+1. **`evaluate_duplicate_1v3` 每条规则重新编译**：actor 权重是闭包常量。
    把 `w_rule` / 权重改为 runtime 参数后，`run_phase0` 的 3 条规则可共享一次编译。
-3. **eval 同时算 candidate + baseline**：每步其实只有一方行动，理论上还能省
+2. **eval 同时算 candidate + baseline**：每步其实只有一方行动，理论上还能省
    1.5~2×；需要按 `cp == agent_seat` 分组，形状会变，风险较高。
-4. **`encode_obs_v6` 计算两次**：candidate 与 baseline 各自编码一次，可上提共享。
-5. **T4 的 FP16**：T4 的 FP16 Tensor Core 明显快于 FP32。若要上混合精度，
+3. **`encode_obs_v6` 计算两次**：candidate 与 baseline 各自编码一次，可上提共享。
+4. **T4 的 FP16**：T4 的 FP16 Tensor Core 明显快于 FP32。若要上混合精度，
    需要保持 Sinkhorn / BCE / 对数域稳定在 FP32，并做 loss scaling；属于较大改动，
-   先在分支上做 A/B。
-6. **Kaggle host 侧开销**：Oracle replay 每个 update 都会把 `ORA_BUF_KEYS` 搬到 host
+   先在分支上做 A/B（建议用 `jmp` 或只对 Conv/Dense 做 cast）。
+5. **Kaggle host 侧开销**：Oracle replay 每个 update 都会把 `ORA_BUF_KEYS` 搬到 host
    （numpy 单线程），2~4 vCPU 上可能成为瓶颈。可考虑 replay 常驻显存、
    或降低 host 拷贝频率。
-7. **`distinct_deck_ratio`**：每个 update 都 `jax.device_get(env_state.round_state.deck)`
+6. **`distinct_deck_ratio`**：每个 update 都 `jax.device_get(env_state.round_state.deck)`
    强制同步；可改为在 device 上算哈希/比例，或每 N 个 update 检查一次。
+7. **指标回传**：每个 update 有 ~8 个单独标量的 `device_get`，可合并成一次
+   `jax.device_get(tuple_of_scalars)`，减少 host 同步次数。
 
 ---
 
@@ -199,10 +241,21 @@ python -m pytest tests/test_v6_legal_ron_and_trinity.py -q
 # 2) 端到端流水线（Belief → GRP → BC → RL → Distill → Duplicate 1v3）
 python -m pytest tests/test_v6_pipeline_smoke.py -q
 
-# 3) 纯环境吞吐（不含 V6 栈）
+# 3) 双卡 trace 回归（单卡机器上伪装 2 个设备）
+python -m pytest tests/test_v6_multigpu_trace.py -q
+
+# 4) 纯环境吞吐（不含 V6 栈）
 python benchmarks/step_speed.py --batch 256 --steps 256
 
-# 4) 训练吞吐：看日志里的 `xxx sps`
+# 5) 训练吞吐：看日志里的 `xxx sps`
 python -m mahjong_rl.trainers.run_local_rl --num-updates 2 --warmup-updates 0 \
   --eval-every 0 --checkpoint-every 0 --log-every 1 --no-resume
+
+# 6) 在单卡机器上验证 pmap 控制流（2 个 CPU 设备）：
+#    结果应与单设备完全一致
+XLA_FLAGS=--xla_force_host_platform_device_count=2 JAX_PLATFORMS=cpu \
+  python -m pytest tests/test_v6_multigpu_trace.py -q
 ```
+
+> 双卡 pmap 的 `evaluate_duplicate_1v3` 与 `_CompiledDuplicateVsBCEvaluator`
+> 已用上述 CPU-2-device 方式在单卡机器上验证过：统计结果与单设备逐位一致。

@@ -110,6 +110,12 @@
 
 6GB 卡上 64 lanes 已实测可跑；更小的卡把 `--eval-chunk-walls` 降到 8。
 
+> Notebook（`notebooks/sovereign_mahjong_v6_kaggle.ipynb`，cell 16）里的
+> `CompiledDuplicate1v3Evaluator` 是独立实现：它已经共享 obs 编码并支持 pmap，
+> 但仍是固定 `max_steps` 的 `lax.scan`，**没有提前退出**。它会自动享受
+> Trinity 批量 GRP 的收益；若要拿到早停收益，后续可迁移到
+> `play_duplicate_chunk`。
+
 ---
 
 ## 5. Kaggle T4×2 训练指南
@@ -209,6 +215,24 @@ done
 - 把 `--out-dir` 指向 `/kaggle/working/...`；会话超时后用同一目录 `--resume`
   续训（默认开启）。
 - `--ckpt-dir` 指向只读的 `/kaggle/input/<dataset>` 即可。
+
+### 5.9 Kaggle 上线检查清单（按顺序执行）
+
+- [ ] **回归**：`python -m pytest tests/test_v6_multigpu_trace.py -q`
+      （确认双卡 tracer 修复生效）
+- [ ] **缓存**：`export JAX_COMPILATION_CACHE_DIR=/kaggle/working/.jax_cache`
+      （会话结束可把它作为 Output/Dataset 保存，下次继续复用）
+- [ ] **batch sweep**：`B=32 / 64 / 128` 各跑 3 个 update，记录第 2/3 个
+      update 的 `sps`；Notebook 的 **2.5 节**已内置这段扫描
+- [ ] **评测参数**：`--eval-chunk-walls` 是**每卡**墙数；
+      `--eval-walls` 取 `chunk_walls × GPU 数` 的整数倍，避免 padding 浪费
+- [ ] **checkpoint**：`--checkpoint-every 50~100`，输出到 `/kaggle/working`
+- [ ] **正式训练**：`--num-envs` 取 sweep 的拐点值（2×T4 通常从 64 起步）
+
+当前 Notebook（`notebooks/sovereign_mahjong_v6_kaggle.ipynb`）已经：
+- 默认拉取 `perf/jax-throughput-kaggle` 分支（合并回 main 后改回 `main`）；
+- 在 2.5 节提供可直接运行的 batch sweep（解析 `sps` 并汇总）；
+- T4×2 预设为 `RL_NUM_ENVS=64`（每卡 32），并标注了 sweep 后如何调整。
 
 ---
 

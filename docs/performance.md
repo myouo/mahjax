@@ -110,11 +110,30 @@
 
 6GB 卡上 64 lanes 已实测可跑；更小的卡把 `--eval-chunk-walls` 降到 8。
 
-> Notebook（`notebooks/sovereign_mahjong_v6_kaggle.ipynb`，cell 16）里的
-> `CompiledDuplicate1v3Evaluator` 是独立实现：它已经共享 obs 编码并支持 pmap，
-> 但仍是固定 `max_steps` 的 `lax.scan`，**没有提前退出**。它会自动享受
-> Trinity 批量 GRP 的收益；若要拿到早停收益，后续可迁移到
-> `play_duplicate_chunk`。
+#### 参数化编译评测器：`CompiledDuplicateEvaluator`
+
+`mahjong_rl/eval/compiled_eval.py` 提供 params-as-args 的评测器：
+
+- candidate policy/belief params 和 `w_rule` 都是 **runtime 参数** → 同一 baseline
+  模式只编译一次；
+- 两种 baseline 模式：`evaluate(...)` vs 3× V6 baseline（params），
+  `evaluate_vs_rule(...)` vs `mahjax.rule_based_player`；
+- joint actor 让 candidate 与 baseline **共享一次 obs/trinity 编码**；
+- 内部用 `play_duplicate_chunk_joint`（早停 while-loop），并 `pmap` 到所有设备；
+- `chunk_walls` 语义是**每卡**墙数。
+
+实测（1×3060，8 墙 = 32 局，`max_steps=1200`，稳态）:
+
+| 模式 | 稳态 | 吞吐 |
+|---|---|---|
+| params（vs 3× BC） | 10.8 s | **2.97 games/s** |
+| rule（vs rule_based） | 9.9 s | **3.22 games/s** |
+
+与旧 notebook 评测器（同配置 24.5 s）相比 **2.3×**；14 项指标与
+`evaluate_duplicate_1v3` 及旧实现 **逐位一致（diff = 0）**。
+
+> Notebook 的周期评测、final head-to-head 与 vs-rule 的多个 candidate 现在都走
+> 这个类：params/rule 各编译一次，candidate 之间不再重编译。
 
 ---
 
@@ -355,8 +374,9 @@ MAHJAX_PROFILE=1 python -m mahjong_rl.trainers.run_local_rl \
 5. **B=512（256/卡）**：进一步提高 env 占用率，预计 3–5%，但要确认 16GB 显存。
 6. **`evaluate_duplicate_1v3` 每条规则重新编译**：把权重/w_rule 改成 runtime 参数，
    phase0 的 3 条规则可共享一次编译。
-7. **notebook 的 `CompiledDuplicate1v3Evaluator` 仍是固定 `max_steps` 的 scan**：
-   迁移到 `play_duplicate_chunk` 可拿早停收益。
+7. **notebook 评测器已迁移**：`CompiledDuplicate1v3Evaluator` 现在是
+   `mahjong_rl.eval.compiled_eval.CompiledDuplicateEvaluator` 的别名，
+   具备早停 + 共享编码 + params-as-args；params/rule 各一次编译。
 8. **pmap 的第二次编译**（update 2 ≈ 200s）：一次性，不占总稳态；用
    `JAX_LOG_COMPILES=1` 定位后可再省 ~3 分钟/新 shape。
 5. **Kaggle host 侧开销**：Oracle replay 每个 update 都会把 `ORA_BUF_KEYS` 搬到 host
@@ -380,6 +400,9 @@ python -m pytest tests/test_v6_pipeline_smoke.py -q
 
 # 3) 双卡 trace 回归（单卡机器上伪装 2 个设备）
 python -m pytest tests/test_v6_multigpu_trace.py -q
+
+# 3b) 参数化评测器两种 baseline 模式
+python -m pytest tests/test_v6_compiled_eval.py -q
 
 # 4) 纯环境吞吐（不含 V6 栈）
 python benchmarks/step_speed.py --batch 256 --steps 256

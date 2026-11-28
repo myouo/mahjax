@@ -16,7 +16,7 @@ Performance notes (why this is fast on a GPU):
 
 from __future__ import annotations
 
-from typing import Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -36,10 +36,9 @@ def _expand_wall_batch(x: jnp.ndarray, num_players: int) -> jnp.ndarray:
     )
 
 
-def play_duplicate_chunk(
+def _play_duplicate_chunk_core(
     env,
-    candidate_actor: Callable[[mahjax.State, jax.Array], jnp.ndarray],
-    baseline_actor: Callable[[mahjax.State, jax.Array], jnp.ndarray],
+    joint_step: Callable[[Any, jax.Array, jax.Array], Tuple[jnp.ndarray, jnp.ndarray]],
     rank_pts_arr: jnp.ndarray,
     init_keys: jax.Array,
     step_seeds: jax.Array,
@@ -48,6 +47,10 @@ def play_duplicate_chunk(
     """Play one chunk of fixed-wall duplicate games with a single batched while-loop.
 
     Args:
+        joint_step: `(states, k_cand, k_base) -> (cand_actions, base_actions)` on the
+            flattened `(walls * 4)` lane batch. `play_duplicate_chunk` wraps two
+            independent actors; `play_duplicate_chunk_joint` lets one actor share
+            feature encoding between both policies.
         init_keys: `(W,)` per-wall deck keys.
         step_seeds: `(W,)` per-wall action/step keys (shared by all 4 seat rotations).
         max_steps: hard safety cap; the loop normally exits when all lanes terminate.
@@ -97,8 +100,9 @@ def play_duplicate_chunk(
 
         is_dummy = states.legal_action_mask[:, Action.DUMMY]
         cp = states.current_player.astype(jnp.int32)
-        a_cand = jax.vmap(candidate_actor)(states, k1).astype(jnp.int32)
-        a_base = jax.vmap(baseline_actor)(states, k2).astype(jnp.int32)
+        a_cand, a_base = joint_step(states, k1, k2)
+        a_cand = a_cand.astype(jnp.int32)
+        a_base = a_base.astype(jnp.int32)
         policy_act = jnp.where(cp == agent_seats, a_cand, a_base)
         action = jnp.where(is_dummy, jnp.int32(Action.DUMMY), policy_act).astype(jnp.int32)
 
@@ -164,6 +168,50 @@ def play_duplicate_chunk(
     shape = (num_walls, num_players)
     totals = {k: v.reshape(shape) for k, v in totals.items()}
     return totals, rank_idx.reshape(shape), pt.reshape(shape), finished.reshape(shape)
+
+
+def play_duplicate_chunk(
+    env,
+    candidate_actor: Callable[[mahjax.State, jax.Array], jnp.ndarray],
+    baseline_actor: Callable[[mahjax.State, jax.Array], jnp.ndarray],
+    rank_pts_arr: jnp.ndarray,
+    init_keys: jax.Array,
+    step_seeds: jax.Array,
+    max_steps: int,
+) -> Tuple[Dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """One chunk with two independent `(state, key) -> action` actors."""
+
+    def joint_step(states, k1, k2):
+        return (
+            jax.vmap(candidate_actor)(states, k1),
+            jax.vmap(baseline_actor)(states, k2),
+        )
+
+    return _play_duplicate_chunk_core(
+        env, joint_step, rank_pts_arr, init_keys, step_seeds, max_steps
+    )
+
+
+def play_duplicate_chunk_joint(
+    env,
+    joint_actor: Callable[[mahjax.State, jax.Array, jax.Array], Tuple[jnp.ndarray, jnp.ndarray]],
+    rank_pts_arr: jnp.ndarray,
+    init_keys: jax.Array,
+    step_seeds: jax.Array,
+    max_steps: int,
+) -> Tuple[Dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """One chunk with `joint_actor(state, k_cand, k_base) -> (cand, base)`.
+
+    Use this when the two policies can share an observation/feature encoding
+    (e.g. candidate and baseline are the same V6 network with different weights).
+    """
+
+    def joint_step(states, k1, k2):
+        return jax.vmap(joint_actor)(states, k1, k2)
+
+    return _play_duplicate_chunk_core(
+        env, joint_step, rank_pts_arr, init_keys, step_seeds, max_steps
+    )
 
 
 def evaluate_duplicate_1v3(

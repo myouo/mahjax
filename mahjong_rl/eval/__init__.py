@@ -1,5 +1,6 @@
 """Evaluation & deployment utilities: Fixed-wall Duplicate 1v3, Replay Reviewer & V6 UI/mjai bridge."""
 
+from mahjong_rl.eval.compiled_eval import CompiledDuplicateEvaluator
 from mahjong_rl.eval.duplicate_eval import evaluate_duplicate_1v3
 from mahjong_rl.eval.mjai_bridge import make_v6_policy_actor, register_ui_agent
 from mahjong_rl.eval.replay_reviewer import (
@@ -11,6 +12,7 @@ from mahjong_rl.eval.replay_reviewer import (
 )
 
 __all__ = [
+    "CompiledDuplicateEvaluator",
     "evaluate_duplicate_1v3",
     "format_terminal_report",
     "load_replay_to_mjai",
